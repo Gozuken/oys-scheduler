@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """
 Baskent OYS -> Google Calendar
-Scrapes all Moodle courses for assignments and announcements.
-Uses Groq AI (FREE, fast) to parse dates and create Google Calendar events.
-PDFs can be added later.
+- Per-course prompts with full context (activities + PDF text)
+- Student profile (name + number) so AI filters for your group/section automatically
+- pypdf for PDF text extraction (no API needed)
+- Groq AI (free, fast) for parsing
+- Google Calendar integration with deduplication
 
 Setup:
-  pip install requests beautifulsoup4 groq google-auth google-auth-oauthlib google-api-python-client python-dotenv tzdata
+  pip install requests beautifulsoup4 groq pypdf google-auth google-auth-oauthlib google-api-python-client python-dotenv tzdata
 
-Create a .env file:
-  OYS_USERNAME=your_student_number
+.env file:
+  OYS_USERNAME=22593244
   OYS_PASSWORD=your_password
-  GROQ_API_KEY=your_free_key   <- get at https://console.groq.com (free, no card)
-
-For Google Calendar setup, follow README_GOOGLE_SETUP.md
+  GROQ_API_KEY=gsk_...
+  STUDENT_NAME=Ahmet Ercan Saz
+  STUDENT_NUMBER=22593244
 """
 
 import os
+import io
 import json
 import re
 import hashlib
@@ -29,6 +32,8 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from groq import Groq
+from pypdf import PdfReader
+from dotenv import load_dotenv
 
 # Google Calendar imports
 from google.auth.transport.requests import Request
@@ -48,8 +53,10 @@ SCOPES     = ["https://www.googleapis.com/auth/calendar"]
 TOKEN_FILE = "token.json"
 CREDS_FILE = "credentials.json"
 SEEN_FILE  = "seen_events.json"
+PDF_CACHE  = "pdf_cache"
 
-GROQ_MODEL = "llama-3.3-70b-versatile"  # free, fast, very capable
+GROQ_MODEL     = "llama-3.3-70b-versatile"
+MAX_PDF_CHARS  = 12000   # truncate very long PDFs to stay within token limits
 
 COURSE_IDS = [10818, 10747, 10289, 10546, 9843, 10164, 5439]
 
@@ -83,13 +90,14 @@ class MoodleScraper:
         log.error("Login failed - check credentials.")
         return False
 
-    def get_course_data(self, course_id: int) -> list[dict]:
+    def get_course_data(self, course_id: int) -> dict:
+        """Scrape one course page, return activities and PDF links."""
         url  = f"{BASE_URL}/course/view.php?id={course_id}"
         soup = BeautifulSoup(self.session.get(url).text, "html.parser")
         h1   = soup.find("h1")
         course_name = h1.get_text(strip=True) if h1 else f"Course {course_id}"
 
-        activities = []
+        activities, pdf_links = [], []
 
         for section in soup.select("li.section.course-section"):
             week_el  = section.find("h3", class_="sectionname")
@@ -105,9 +113,20 @@ class MoodleScraper:
                     span.decompose()
                 activity_name = name_el.get_text(strip=True)
                 mod_classes   = " ".join(activity.get("class", []))
-                is_assign     = "modtype_assign" in mod_classes
+                is_assign     = "modtype_assign"   in mod_classes
+                is_resource   = "modtype_resource" in mod_classes
                 link_el       = activity.find("a", class_="aalink")
                 link          = link_el["href"] if link_el and link_el.get("href") else ""
+
+                # Collect PDF links (skip archives)
+                if is_resource and link:
+                    badge      = activity.find("span", class_="activitybadge")
+                    badge_text = badge.get_text(strip=True).upper() if badge else ""
+                    if badge_text not in ("RAR", "ZIP", "7Z", "TAR", "GZ"):
+                        pdf_links.append({
+                            "name": activity_name, "file_type": badge_text,
+                            "view_url": link, "week": week,
+                        })
 
                 opened = due = None
                 date_region = activity.find("div", {"data-region": "activity-dates"})
@@ -123,68 +142,170 @@ class MoodleScraper:
                 description = desc_div.get_text(separator=" ", strip=True) if desc_div else ""
 
                 activities.append({
-                    "course_id": course_id, "course_name": course_name,
-                    "week": week, "activity_name": activity_name,
-                    "is_assignment": is_assign, "opened": opened, "due": due,
+                    "activity_name": activity_name, "is_assignment": is_assign,
+                    "week": week, "opened": opened, "due": due,
                     "description": description, "section_info": section_info, "link": link,
                 })
 
-        log.info(f"  -> {course_name}: {len(activities)} activities")
-        return activities
+        log.info(f"  -> {course_name}: {len(activities)} activities, {len(pdf_links)} PDFs")
+        return {
+            "course_id":   course_id,
+            "course_name": course_name,
+            "activities":  activities,
+            "pdf_links":   pdf_links,
+        }
 
     def scrape_all_courses(self) -> list[dict]:
-        all_activities = []
+        courses = []
         for cid in COURSE_IDS:
             try:
-                all_activities.extend(self.get_course_data(cid))
+                courses.append(self.get_course_data(cid))
             except Exception as e:
                 log.warning(f"Failed to scrape course {cid}: {e}")
-        return all_activities
+        return courses
+
+    def download_pdf(self, view_url: str) -> bytes | None:
+        try:
+            r            = self.session.get(view_url, allow_redirects=True, stream=True, timeout=30)
+            content_type = r.headers.get("Content-Type", "")
+
+            if "text/html" in content_type:
+                soup  = BeautifulSoup(r.text, "html.parser")
+                pdf_a = (
+                    soup.find("a", href=re.compile(r"pluginfile\.php.*\.pdf", re.I)) or
+                    soup.find("a", href=re.compile(r"\.pdf", re.I)) or
+                    soup.find("a", href=re.compile(r"pluginfile\.php", re.I))
+                )
+                if not pdf_a:
+                    return None
+                r            = self.session.get(pdf_a["href"], stream=True, timeout=30)
+                content_type = r.headers.get("Content-Type", "")
+
+            if "pdf" not in content_type.lower():
+                return None
+
+            data = b"".join(r.iter_content(chunk_size=65536))
+            return data if data and b"%PDF" in data[:10] else None
+
+        except Exception as e:
+            log.warning(f"  Download failed {view_url}: {e}")
+            return None
+
+    def get_cached_pdf(self, view_url: str) -> bytes | None:
+        cache_dir  = Path(PDF_CACHE)
+        cache_dir.mkdir(exist_ok=True)
+        cache_path = cache_dir / f"{hashlib.md5(view_url.encode()).hexdigest()}.pdf"
+
+        if cache_path.exists():
+            return cache_path.read_bytes()
+
+        data = self.download_pdf(view_url)
+        if data:
+            cache_path.write_bytes(data)
+        return data
+
+
+# ── PDF Text Extraction ───────────────────────────────────────────────────────
+
+def extract_pdf_text(pdf_bytes: bytes, max_chars: int = MAX_PDF_CHARS) -> str:
+    """Extract text from PDF bytes using pypdf."""
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        text   = "\n".join(
+            page.extract_text() or "" for page in reader.pages
+        ).strip()
+        if len(text) > max_chars:
+            text = text[:max_chars] + f"\n... [truncated at {max_chars} chars]"
+        return text
+    except Exception as e:
+        log.warning(f"  PDF text extraction failed: {e}")
+        return ""
 
 
 # ── Groq Parser ───────────────────────────────────────────────────────────────
 
-def parse_activities_with_groq(items: list[dict], client: Groq) -> list[dict]:
-    relevant = [i for i in items if i.get("due") or i.get("opened")]
-    if not relevant:
-        log.info("No date-bearing activities found.")
-        return []
+SYSTEM_PROMPT = """You are a university student assistant that creates Google Calendar events.
+You receive course data including activities and PDF content.
+You use the student's name and number to filter group/section assignments — 
+only create events relevant to THIS student, not other groups or sections.
+Always return valid JSON arrays only. No markdown, no explanation."""
 
+
+def build_course_prompt(course: dict, pdf_texts: list[dict], student_name: str, student_number: str) -> str:
     today = datetime.now(ZoneInfo(TIMEZONE)).strftime("%A, %d %B %Y")
 
-    prompt = f"""You are a student assistant helping manage a university schedule.
-Convert these Moodle course activities into Google Calendar events.
+    # Format activities
+    relevant = [a for a in course["activities"] if a.get("due") or a.get("opened")]
+    activities_text = json.dumps(relevant, ensure_ascii=False, indent=2) if relevant else "None"
 
-Today is {today}. Timezone: {TIMEZONE}.
-Moodle dates look like "Friday, 6 March 2026, 11:59 PM" - parse them carefully into ISO 8601.
+    # Format PDF texts
+    if pdf_texts:
+        pdfs_text = "\n\n".join(
+            f"=== PDF: {p['name']} ===\n{p['text']}" for p in pdf_texts if p["text"]
+        )
+    else:
+        pdfs_text = "None"
 
-For each activity return a JSON object with EXACTLY these fields:
-- summary: short title e.g. "MAT286 Odev-1 Due" or "BIL344 Assignment Due"
-- description: 2-3 sentences - what to do, any instructions from section_info, and the link
-- start_datetime: ISO 8601 with timezone offset e.g. "2026-03-06T23:59:00+03:00" (Istanbul is UTC+3)
-- end_datetime: ISO 8601, exactly 1 hour after start_datetime
-- reminder_minutes: [1440, 360, 60] for due dates, [1440] for opened/available
-- color_id: "11" for due dates, "5" for opened dates, "9" if due within 3 days of today
-- unique_key: lowercase no-spaces string e.g. "mat286_odev1_due"
+    return f"""STUDENT PROFILE:
+  Name: {student_name}
+  Student Number: {student_number}
 
-Return ONLY a valid JSON array, no markdown, no explanation, no extra text.
+COURSE: {course["course_name"]}
+Today: {today} | Timezone: {TIMEZONE} (UTC+3)
 
-Activities:
-{json.dumps(relevant, ensure_ascii=False, indent=2)}
+INSTRUCTIONS:
+- Create Google Calendar events for this course only
+- If a PDF contains a group/section/lab schedule, find the student by name or number
+  and ONLY create the event for their specific day/time — skip all other groups
+- Extract exam dates, assignment due dates, project deadlines, grading policy from PDFs
+- Moodle dates look like "Friday, 6 March 2026, 11:59 PM"
+
+For each event return a JSON object with EXACTLY:
+- summary: e.g. "MAT286 Odev-1 Due" or "BIL332 Lab-1 Due"
+- description: details including requirements, topics, grading weight, link
+- start_datetime: ISO 8601 with +03:00 offset e.g. "2026-03-06T23:59:00+03:00"
+- end_datetime: ISO 8601, 1 hour after start (2 hours for exams)
+- reminder_minutes: [10080, 1440, 180] for exams | [1440, 360, 60] for deadlines | [1440] for info
+- color_id: "6" for exams | "11" for deadlines | "3" for grading/info | "5" for office hours
+- unique_key: lowercase no-spaces e.g. "mat286_odev1_due" or "bil332_lab1_sec1"
+
+Return [] if there is nothing relevant to calendar for this student.
+Return ONLY a valid JSON array, no markdown, no extra text.
+
+--- COURSE ACTIVITIES ---
+{activities_text}
+
+--- COURSE PDFs ---
+{pdfs_text}
 """
 
-    log.info(f"Sending {len(relevant)} activities to Groq (1 API call)...")
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,      # low temp = more deterministic JSON
-        max_tokens=4096,
-    )
 
-    raw    = response.choices[0].message.content
-    events = _parse_json_response(raw)
-    log.info(f"  -> {len(events)} calendar events parsed")
-    return events
+def parse_course_with_groq(course: dict, pdf_texts: list[dict],
+                            student_name: str, student_number: str,
+                            client: Groq) -> list[dict]:
+    prompt = build_course_prompt(course, pdf_texts, student_name, student_number)
+
+    log.info(f"  Sending to Groq: {course['course_name']}")
+    try:
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=4096,
+        )
+        raw    = response.choices[0].message.content
+        events = _parse_json_response(raw)
+        # Tag each event with course info for debugging
+        for ev in events:
+            ev.setdefault("course", course["course_name"])
+        log.info(f"  -> {len(events)} events for {course['course_name']}")
+        return events
+    except Exception as e:
+        log.error(f"  Groq failed for {course['course_name']}: {e}")
+        return []
 
 
 def _parse_json_response(text: str) -> list[dict]:
@@ -240,9 +361,8 @@ def create_calendar_events(events: list[dict], dry_run: bool = False) -> int:
         if key in seen:
             log.info(f"  [skip duplicate] {ev.get('summary')}")
             continue
-
         if not ev.get("start_datetime") or not ev.get("end_datetime"):
-            log.warning(f"  Skipping event with missing datetime: {ev.get('summary')}")
+            log.warning(f"  Skipping event missing datetime: {ev.get('summary')}")
             continue
 
         body = {
@@ -265,7 +385,7 @@ def create_calendar_events(events: list[dict], dry_run: bool = False) -> int:
             print(f"\n  [DRY RUN] {body['summary']}")
             print(f"    Start    : {body['start']['dateTime']}")
             print(f"    Reminders: {ev.get('reminder_minutes')}")
-            print(f"    Desc     : {body['description'][:120]}")
+            print(f"    Desc     : {body['description'][:150]}")
         else:
             try:
                 result = service.events().insert(calendarId="primary", body=body).execute()
@@ -284,48 +404,89 @@ def create_calendar_events(events: list[dict], dry_run: bool = False) -> int:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="OYS -> Google Calendar sync (powered by Groq)")
-    parser.add_argument("--dry-run", action="store_true", help="Show events without creating them")
-    parser.add_argument("--no-ai",   action="store_true", help="Print raw scraped data only")
+    parser = argparse.ArgumentParser(description="OYS -> Google Calendar (per-course, PDF-aware)")
+    parser.add_argument("--dry-run",     action="store_true", help="Preview events without creating them")
+    parser.add_argument("--no-ai",       action="store_true", help="Print raw scraped data only")
+    parser.add_argument("--no-pdfs",     action="store_true", help="Skip PDF downloading and parsing")
+    parser.add_argument("--clear-cache", action="store_true", help="Re-download all PDFs")
     args = parser.parse_args()
 
-    username = os.environ.get("OYS_USERNAME")
-    password = os.environ.get("OYS_PASSWORD")
-    if not username or not password:
-        raise ValueError("Set OYS_USERNAME and OYS_PASSWORD in your .env file")
+    # Load credentials
+    username       = os.environ.get("OYS_USERNAME")
+    password       = os.environ.get("OYS_PASSWORD")
+    student_name   = os.environ.get("STUDENT_NAME")
+    student_number = os.environ.get("STUDENT_NUMBER")
 
-    # 1. Scrape
+    if not username or not password:
+        raise ValueError("Set OYS_USERNAME and OYS_PASSWORD in .env")
+    if not student_name or not student_number:
+        raise ValueError("Set STUDENT_NAME and STUDENT_NUMBER in .env")
+
+    if args.clear_cache:
+        import shutil
+        shutil.rmtree(PDF_CACHE, ignore_errors=True)
+        log.info("PDF cache cleared.")
+
+    # 1. Scrape all courses
     scraper = MoodleScraper(username, password)
     if not scraper.login():
         return
 
     log.info("Scraping all courses...")
-    activities = scraper.scrape_all_courses()
-    log.info(f"Total: {len(activities)} activities found")
+    courses = scraper.scrape_all_courses()
+    log.info(f"Found {len(courses)} courses")
 
     if args.no_ai:
-        print(json.dumps(activities, ensure_ascii=False, indent=2))
+        print(json.dumps(courses, ensure_ascii=False, indent=2))
         return
 
     # 2. Set up Groq
     groq_key = os.environ.get("GROQ_API_KEY")
     if not groq_key:
-        raise ValueError("Set GROQ_API_KEY in your .env file  (free at https://console.groq.com)")
+        raise ValueError("Set GROQ_API_KEY in .env  (free at https://console.groq.com)")
     client = Groq(api_key=groq_key)
 
-    # 3. Parse with Groq (single API call)
-    events = parse_activities_with_groq(activities, client)
+    all_events = []
 
-    if not events:
-        log.info("No events to add.")
+    # 3. Process each course separately
+    for course in courses:
+        log.info(f"\nProcessing: {course['course_name']}")
+
+        # Download and extract PDF text for this course
+        pdf_texts = []
+        if not args.no_pdfs and course["pdf_links"]:
+            log.info(f"  Downloading {len(course['pdf_links'])} PDFs...")
+            for pdf_info in course["pdf_links"]:
+                pdf_bytes = scraper.get_cached_pdf(pdf_info["view_url"])
+                if pdf_bytes:
+                    text = extract_pdf_text(pdf_bytes)
+                    if text:
+                        pdf_texts.append({"name": pdf_info["name"], "text": text})
+                        log.info(f"    Extracted {len(text)} chars from '{pdf_info['name']}'")
+                    else:
+                        log.info(f"    No text extracted from '{pdf_info['name']}' (may be scanned)")
+
+        # Skip course if nothing to process
+        has_dated_activities = any(a.get("due") or a.get("opened") for a in course["activities"])
+        if not has_dated_activities and not pdf_texts:
+            log.info(f"  Nothing to process for {course['course_name']}, skipping.")
+            continue
+
+        # Send to Groq
+        events = parse_course_with_groq(course, pdf_texts, student_name, student_number, client)
+        all_events.extend(events)
+
+    log.info(f"\nTotal events across all courses: {len(all_events)}")
+    if not all_events:
+        log.info("Nothing to add to calendar.")
         return
 
     # 4. Create calendar events
-    n = create_calendar_events(events, dry_run=args.dry_run)
+    n = create_calendar_events(all_events, dry_run=args.dry_run)
     if not args.dry_run:
         log.info(f"\nDone! Added {n} new events to Google Calendar.")
     else:
-        log.info(f"\n[DRY RUN] Would create {len(events)} events total.")
+        log.info(f"\n[DRY RUN] Would create {len(all_events)} events total.")
 
 
 if __name__ == "__main__":
