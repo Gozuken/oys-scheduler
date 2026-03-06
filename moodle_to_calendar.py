@@ -33,7 +33,6 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from groq import Groq
 from pypdf import PdfReader
-from dotenv import load_dotenv
 
 # Google Calendar imports
 from google.auth.transport.requests import Request
@@ -62,6 +61,9 @@ COURSE_IDS = [10818, 10747, 10289, 10546, 9843, 10164, 5439]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
+
+# Silence noisy pypdf warnings about malformed PDFs
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 # ── Moodle Scraper ────────────────────────────────────────────────────────────
 
@@ -308,7 +310,25 @@ def parse_course_with_groq(course: dict, pdf_texts: list[dict],
         return []
 
 
+
+# Keywords in PDF names that indicate lecture content (not useful for calendar)
+# Using allowlist instead: only send PDFs whose names suggest scheduling/admin content
+USEFUL_PDF_KEYWORDS = [
+    "syllabus", "izlence", "icerik", "içerik", "program",
+    "lab", "schedule", "group", "grup", "proje", "project",
+    "rules", "kural", "odev", "ödev", "assignment",
+    "exam", "sinav", "sınav", "midterm", "final",
+    "preliminary", "on hazirlik", "ön hazırlık",
+]
+
+def is_useful_pdf(name: str) -> bool:
+    """Only send PDFs whose names suggest they contain scheduling or admin info."""
+    name_lower = name.lower()
+    return any(kw in name_lower for kw in USEFUL_PDF_KEYWORDS)
+
+
 def _parse_json_response(text: str) -> list[dict]:
+    """Strip markdown fences and parse JSON array."""
     text = text.strip()
     text = re.sub(r"^```[a-z]*\n?", "", text)
     text = re.sub(r"\n?```$", "", text)
@@ -389,7 +409,13 @@ def create_calendar_events(events: list[dict], dry_run: bool = False) -> int:
         else:
             try:
                 result = service.events().insert(calendarId="primary", body=body).execute()
-                log.info(f"  Created: {body['summary']}  ->  {result.get('htmlLink')}")
+                log.info(
+                    f"  Created: {body['summary']}\n"
+                    f"    Start   : {body['start']['dateTime']}\n"
+                    f"    End     : {body['end']['dateTime']}\n"
+                    f"    Desc    : {body['description'][:200]}\n"
+                    f"    Link    : {result.get('htmlLink')}"
+                )
                 created += 1
                 seen.add(key)
             except HttpError as e:
@@ -400,6 +426,28 @@ def create_calendar_events(events: list[dict], dry_run: bool = False) -> int:
     return created
 
 
+def pick_pdfs_interactively(course_name: str, pdf_links: list[dict]) -> list[dict]:
+    """Show a numbered list of PDFs and let the user choose which to download."""
+    if not pdf_links:
+        return []
+    print(f"\n  PDFs for: {course_name}")
+    for i, p in enumerate(pdf_links, 1):
+        print(f"    [{i}] {p['name']}  ({p.get('file_type','PDF')})")
+    print(f"    [0] Skip all")
+    raw = input("  Select PDFs (e.g. 1 3 4, or 0 to skip): ").strip()
+    if not raw or raw == "0":
+        return []
+    chosen = []
+    for tok in raw.split():
+        try:
+            idx = int(tok)
+            if 1 <= idx <= len(pdf_links):
+                chosen.append(pdf_links[idx - 1])
+        except ValueError:
+            pass
+    return chosen
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -408,6 +456,7 @@ def main():
     parser.add_argument("--dry-run",     action="store_true", help="Preview events without creating them")
     parser.add_argument("--no-ai",       action="store_true", help="Print raw scraped data only")
     parser.add_argument("--no-pdfs",     action="store_true", help="Skip PDF downloading and parsing")
+    parser.add_argument("--pick-pdfs",   action="store_true", help="Interactively choose which PDFs to use per course")
     parser.add_argument("--clear-cache", action="store_true", help="Re-download all PDFs")
     args = parser.parse_args()
 
@@ -455,8 +504,17 @@ def main():
         # Download and extract PDF text for this course
         pdf_texts = []
         if not args.no_pdfs and course["pdf_links"]:
-            log.info(f"  Downloading {len(course['pdf_links'])} PDFs...")
-            for pdf_info in course["pdf_links"]:
+            if args.pick_pdfs:
+                useful = pick_pdfs_interactively(course["course_name"], course["pdf_links"])
+                log.info(f"  Downloading {len(useful)} selected PDFs...")
+            else:
+                useful = [p for p in course["pdf_links"] if is_useful_pdf(p["name"])]
+                skipped = len(course["pdf_links"]) - len(useful)
+                if skipped:
+                    log.info(f"  Skipping {skipped} lecture/slide PDFs, downloading {len(useful)} useful PDFs...")
+                else:
+                    log.info(f"  Downloading {len(useful)} PDFs...")
+            for pdf_info in useful:
                 pdf_bytes = scraper.get_cached_pdf(pdf_info["view_url"])
                 if pdf_bytes:
                     text = extract_pdf_text(pdf_bytes)
