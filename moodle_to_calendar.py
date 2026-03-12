@@ -60,8 +60,73 @@ MAX_PDF_CHARS  = 12000   # truncate very long PDFs to stay within token limits
 
 COURSE_IDS = [10818, 10747, 10289, 10546, 9843, 10164, 5439]
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+# ── Colored terminal output ───────────────────────────────────────────────────
+
+class _C:
+    RESET  = "\033[0m"
+    BOLD   = "\033[1m"
+    DIM    = "\033[2m"
+    # Foreground
+    WHITE  = "\033[97m"
+    CYAN   = "\033[96m"
+    GREEN  = "\033[92m"
+    YELLOW = "\033[93m"
+    RED    = "\033[91m"
+    BLUE   = "\033[94m"
+    MAGENTA= "\033[95m"
+    GRAY   = "\033[90m"
+
+def _section(title: str):
+    width = 60
+    bar   = "─" * width
+    print(f"\n{_C.BOLD}{_C.CYAN}{bar}{_C.RESET}")
+    print(f"{_C.BOLD}{_C.CYAN}  {title}{_C.RESET}")
+    print(f"{_C.BOLD}{_C.CYAN}{bar}{_C.RESET}")
+
+def _course_header(name: str):
+    print(f"\n{_C.BOLD}{_C.BLUE}▶  {name}{_C.RESET}")
+
+def _ok(msg: str):
+    print(f"  {_C.GREEN}✓{_C.RESET}  {msg}")
+
+def _info(msg: str):
+    print(f"  {_C.CYAN}·{_C.RESET}  {_C.DIM}{msg}{_C.RESET}")
+
+def _warn(msg: str):
+    print(f"  {_C.YELLOW}⚠{_C.RESET}  {_C.YELLOW}{msg}{_C.RESET}")
+
+def _err(msg: str):
+    print(f"  {_C.RED}✗{_C.RESET}  {_C.RED}{msg}{_C.RESET}")
+
+def _skip(msg: str):
+    print(f"  {_C.GRAY}⊘  {msg}{_C.RESET}")
+
+def _event(summary: str, start: str, desc: str):
+    print(f"  {_C.MAGENTA}◆{_C.RESET}  {_C.BOLD}{summary}{_C.RESET}")
+    print(f"     {_C.DIM}Start : {start}{_C.RESET}")
+    if desc:
+        print(f"     {_C.DIM}Desc  : {desc[:120]}{_C.RESET}")
+
+
+class _ColoredFormatter(logging.Formatter):
+    _LEVELS = {
+        logging.DEBUG:    (_C.GRAY,   "DEBUG"),
+        logging.INFO:     (_C.CYAN,   "INFO "),
+        logging.WARNING:  (_C.YELLOW, "WARN "),
+        logging.ERROR:    (_C.RED,    "ERROR"),
+        logging.CRITICAL: (_C.RED,    "CRIT "),
+    }
+    def format(self, record):
+        color, label = self._LEVELS.get(record.levelno, (_C.RESET, "?????"))
+        ts  = datetime.now().strftime("%H:%M:%S")
+        msg = record.getMessage()
+        return f"{_C.GRAY}{ts}{_C.RESET}  {color}{label}{_C.RESET}  {msg}"
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(_ColoredFormatter())
+logging.basicConfig(level=logging.WARNING, handlers=[_handler])
 log = logging.getLogger(__name__)
+log.setLevel(logging.DEBUG)
 
 # Silence noisy pypdf warnings about malformed PDFs
 logging.getLogger("pypdf").setLevel(logging.ERROR)
@@ -78,30 +143,30 @@ class MoodleScraper:
         self.userid:  int | None = None
 
     def login(self) -> bool:
-        log.info("Logging in to OYS...")
+        _info("Logging in to OYS...")
         r    = self.session.get(LOGIN_URL)
         soup = BeautifulSoup(r.text, "html.parser")
         tok  = soup.find("input", {"name": "logintoken"})
         if not tok:
-            log.error("logintoken not found.")
+            _err("logintoken not found")
             return False
         r = self.session.post(LOGIN_URL, data={
             "username": self.username, "password": self.password,
             "logintoken": tok["value"], "anchor": "",
         })
         if "Log out" in r.text or "\u00c7\u0131k\u0131\u015f" in r.text:
-            log.info("Login successful")
+            _ok("Login successful")
             # Extract sesskey and userid from the post-login page JS config
             sk = re.search(r'"sesskey"\s*:\s*"([^"]+)"', r.text)
             uid = re.search(r'"userId"\s*:\s*(\d+)', r.text)
             self.sesskey = sk.group(1)  if sk  else None
             self.userid  = int(uid.group(1)) if uid else None
             if self.sesskey:
-                log.info(f"  sesskey extracted, userid={self.userid}")
+                _info(f"sesskey extracted  ·  userid={self.userid}")
             else:
-                log.warning("  sesskey not found in page — message fetching will be skipped")
+                _warn("sesskey not found — message fetching will be skipped")
             return True
-        log.error("Login failed - check credentials.")
+        _err("Login failed — check credentials")
         return False
 
     def get_course_data(self, course_id: int) -> dict:
@@ -163,7 +228,7 @@ class MoodleScraper:
                     "description": description, "section_info": section_info, "link": link,
                 })
 
-        log.info(f"  -> {course_name}: {len(activities)} activities, {len(pdf_links)} PDFs")
+        _info(f"{course_name}  ·  {len(activities)} activities  ·  {len(pdf_links)} PDFs")
         return {
             "course_id":        course_id,
             "course_name":      course_name,
@@ -178,7 +243,7 @@ class MoodleScraper:
             try:
                 courses.append(self.get_course_data(cid))
             except Exception as e:
-                log.warning(f"Failed to scrape course {cid}: {e}")
+                _warn(f"Failed to scrape course {cid}: {e}")
         return courses
 
     def download_pdf(self, view_url: str) -> bytes | None:
@@ -205,7 +270,7 @@ class MoodleScraper:
             return data if data and b"%PDF" in data[:10] else None
 
         except Exception as e:
-            log.warning(f"  Download failed {view_url}: {e}")
+            _warn(f"Download failed: {e}")
             return None
 
     def get_cached_pdf(self, view_url: str) -> bytes | None:
@@ -235,7 +300,7 @@ class MoodleScraper:
         Only returns messages newer than `days` days.
         """
         if not self.sesskey or not self.userid:
-            log.warning("  Skipping messages: sesskey/userid not available")
+            _warn("Skipping messages: sesskey/userid not available")
             return []
 
         cutoff = datetime.now(ZoneInfo(TIMEZONE)).timestamp() - days * 86400
@@ -256,10 +321,10 @@ class MoodleScraper:
             }])
             conversations = resp[0]["data"]["conversations"]
         except Exception as e:
-            log.warning(f"  Failed to fetch conversations: {e}")
+            _warn(f"Failed to fetch conversations: {e}")
             return []
 
-        log.info(f"  Found {len(conversations)} conversations, fetching recent messages...")
+        _info(f"Found {len(conversations)} conversations — fetching messages...")
 
         all_messages = []
         for conv in conversations:
@@ -281,7 +346,7 @@ class MoodleScraper:
                 }])
                 messages = resp[0]["data"]["messages"]
             except Exception as e:
-                log.warning(f"  Failed to fetch messages for conv {conv_id}: {e}")
+                _warn(f"Failed to fetch messages for conv {conv_id}: {e}")
                 continue
 
             for msg in messages:
@@ -300,7 +365,7 @@ class MoodleScraper:
                     "date":        datetime.fromtimestamp(msg["timecreated"], ZoneInfo(TIMEZONE)).strftime("%d %B %Y %H:%M"),
                 })
 
-        log.info(f"  Fetched {len(all_messages)} recent messages (last {days} days)")
+        _ok(f"Fetched {len(all_messages)} messages from the last {days} days")
         return all_messages
 
 
@@ -317,7 +382,7 @@ def extract_pdf_text(pdf_bytes: bytes, max_chars: int = MAX_PDF_CHARS) -> str:
             text = text[:max_chars] + f"\n... [truncated at {max_chars} chars]"
         return text
     except Exception as e:
-        log.warning(f"  PDF text extraction failed: {e}")
+        _warn(f"PDF text extraction failed: {e}")
         return ""
 
 
@@ -404,7 +469,7 @@ def parse_course_with_groq(course: dict, pdf_texts: list[dict],
                             client: Groq, messages: list[dict] | None = None) -> list[dict]:
     prompt = build_course_prompt(course, pdf_texts, student_name, student_number, messages)
 
-    log.info(f"  Sending to Groq: {course['course_name']}")
+    _info(f"Sending to Groq...")
     try:
         response = client.chat.completions.create(
             model=GROQ_MODEL,
@@ -420,10 +485,10 @@ def parse_course_with_groq(course: dict, pdf_texts: list[dict],
         # Tag each event with course info for debugging
         for ev in events:
             ev.setdefault("course", course["course_name"])
-        log.info(f"  -> {len(events)} events for {course['course_name']}")
+        _ok(f"{len(events)} events extracted")
         return events
     except Exception as e:
-        log.error(f"  Groq failed for {course['course_name']}: {e}")
+        _err(f"Groq failed: {e}")
         return []
 
 
@@ -463,18 +528,18 @@ def ai_filter_pdfs(pdf_links: list[dict], course_name: str,
             raw = re.sub(r"\n?```$", "", raw)
             selected = set(json.loads(raw)) if raw != "[]" else set()
         except Exception as e:
-            log.warning(f"  AI PDF filter failed ({e}); including all unknown PDFs as fallback")
+            _warn(f"AI PDF filter failed ({e}) — including all as fallback")
             selected = set(range(1, len(unknown) + 1))
 
         for i, p in enumerate(unknown):
             choices[p["view_url"]] = ((i + 1) in selected)
         save_pdf_choices(choices)
-        log.info(f"  AI classified {len(unknown)} new PDFs, kept {len(selected)}")
+        _ok(f"AI classified {len(unknown)} new PDFs — kept {len(selected)}")
 
     useful = [p for p in pdf_links if choices.get(p["view_url"], False)]
     skipped = len(pdf_links) - len(useful)
     if skipped:
-        log.info(f"  Skipping {skipped} lecture PDFs (cached), downloading {len(useful)} useful PDFs")
+        _info(f"Skipping {skipped} lecture PDFs (cached)  ·  downloading {len(useful)} useful")
     return useful
 
 
@@ -487,7 +552,7 @@ def _parse_json_response(text: str) -> list[dict]:
         result = json.loads(text)
         return result if isinstance(result, list) else []
     except json.JSONDecodeError as e:
-        log.error(f"JSON parse error: {e}\n{text[:400]}")
+        _err(f"JSON parse error: {e}")
         return []
 
 
@@ -530,10 +595,10 @@ def create_calendar_events(events: list[dict], dry_run: bool = False) -> int:
     for ev in events:
         key = ev.get("unique_key", "")
         if key in seen:
-            log.info(f"  [skip duplicate] {ev.get('summary')}")
+            _skip(f"Duplicate: {ev.get('summary')}")
             continue
         if not ev.get("start_datetime") or not ev.get("end_datetime"):
-            log.warning(f"  Skipping event missing datetime: {ev.get('summary')}")
+            _warn(f"Missing datetime, skipping: {ev.get('summary')}")
             continue
 
         body = {
@@ -553,24 +618,15 @@ def create_calendar_events(events: list[dict], dry_run: bool = False) -> int:
         }
 
         if dry_run:
-            print(f"\n  [DRY RUN] {body['summary']}")
-            print(f"    Start    : {body['start']['dateTime']}")
-            print(f"    Reminders: {ev.get('reminder_minutes')}")
-            print(f"    Desc     : {body['description'][:150]}")
+            _event(f"[DRY RUN] {body['summary']}", body['start']['dateTime'], body['description'])
         else:
             try:
                 result = service.events().insert(calendarId="primary", body=body).execute()
-                log.info(
-                    f"  Created: {body['summary']}\n"
-                    f"    Start   : {body['start']['dateTime']}\n"
-                    f"    End     : {body['end']['dateTime']}\n"
-                    f"    Desc    : {body['description'][:200]}\n"
-                    f"    Link    : {result.get('htmlLink')}"
-                )
+                _ok(f"Created: {body['summary']}  ·  {body['start']['dateTime']}")
                 created += 1
                 seen.add(key)
             except HttpError as e:
-                log.error(f"  Failed '{body['summary']}': {e}")
+                _err(f"Failed to create '{body['summary']}': {e}")
 
     if not dry_run:
         save_seen(seen)
@@ -618,12 +674,12 @@ def pick_pdfs_interactively(course_name: str, pdf_links: list[dict],
         for i, p in enumerate(new_pdfs):
             choices[p["view_url"]] = (i in selected_indices)
         save_pdf_choices(choices)
-        log.info(f"  Choices saved to {PDF_CHOICES_FILE}")
+        _ok(f"Choices saved to {PDF_CHOICES_FILE}")
 
     chosen = [p for p in pdf_links if choices.get(p["view_url"], False)]
     skipped = len(pdf_links) - len(chosen)
     if skipped:
-        log.info(f"  {len(chosen)} included, {skipped} skipped (saved choices)")
+        _info(f"{len(chosen)} included  ·  {skipped} skipped (saved choices)")
     return chosen
 
 
@@ -654,20 +710,20 @@ def main():
     if args.clear_cache:
         import shutil
         shutil.rmtree(PDF_CACHE, ignore_errors=True)
-        log.info("PDF cache cleared.")
+        _ok("PDF cache cleared")
 
     if args.reset_choices:
         Path(PDF_CHOICES_FILE).unlink(missing_ok=True)
-        log.info("PDF choices reset — you will be asked again on next run.")
+        _ok("PDF choices reset — you will be asked again on next run")
 
     # 1. Scrape all courses
     scraper = MoodleScraper(username, password)
     if not scraper.login():
         return
 
-    log.info("Scraping all courses...")
+    _section("SCRAPING COURSES")
     courses = scraper.scrape_all_courses()
-    log.info(f"Found {len(courses)} courses")
+    _ok(f"Found {len(courses)} courses")
 
     if args.no_ai:
         print(json.dumps(courses, ensure_ascii=False, indent=2))
@@ -680,7 +736,7 @@ def main():
     client = Groq(api_key=groq_key)
 
     # Fetch recent messages once — passed to every course prompt as extra context
-    log.info("Fetching recent messages...")
+    _section("MESSAGES")
     recent_messages = scraper.get_recent_messages(days=30)
 
     all_events = []
@@ -688,14 +744,14 @@ def main():
 
     # 3. Process each course separately
     for course in courses:
-        log.info(f"\nProcessing: {course['course_name']}")
+        _course_header(course['course_name'])
 
         # Download and extract PDF text for this course
         pdf_texts = []
         if not args.no_pdfs and course["pdf_links"]:
             if args.pick_pdfs:
                 useful = pick_pdfs_interactively(course["course_name"], course["pdf_links"], pdf_choices)
-                log.info(f"  Downloading {len(useful)} selected PDFs...")
+                _info(f"Downloading {len(useful)} selected PDFs...")
             else:
                 useful = ai_filter_pdfs(course["pdf_links"], course["course_name"], pdf_choices, client)
             for pdf_info in useful:
@@ -704,32 +760,33 @@ def main():
                     text = extract_pdf_text(pdf_bytes)
                     if text:
                         pdf_texts.append({"name": pdf_info["name"], "text": text})
-                        log.info(f"    Extracted {len(text)} chars from '{pdf_info['name']}'")
+                        _ok(f"Extracted {len(text):,} chars from '{pdf_info['name']}'")
                     else:
-                        log.info(f"    No text extracted from '{pdf_info['name']}' (may be scanned)")
+                        _warn(f"No text extracted from '{pdf_info['name']}' (may be scanned)")
 
         # Skip course if nothing to process
         has_dated_activities = any(a.get("due") or a.get("opened") for a in course["activities"])
         has_summaries        = bool(course.get("section_summaries"))
         if not has_dated_activities and not pdf_texts and not has_summaries and not recent_messages:
-            log.info(f"  Nothing to process for {course['course_name']}, skipping.")
+            _skip(f"Nothing to process — skipping")
             continue
 
         # Send to Groq
         events = parse_course_with_groq(course, pdf_texts, student_name, student_number, client, recent_messages)
         all_events.extend(events)
 
-    log.info(f"\nTotal events across all courses: {len(all_events)}")
+    _section(f"RESULTS")
+    _ok(f"Total events found: {len(all_events)}")
     if not all_events:
-        log.info("Nothing to add to calendar.")
+        _info("Nothing new to add to calendar")
         return
 
     # 4. Create calendar events
     n = create_calendar_events(all_events, dry_run=args.dry_run)
     if not args.dry_run:
-        log.info(f"\nDone! Added {n} new events to Google Calendar.")
+        _ok(f"Done! Added {n} new events to Google Calendar")
     else:
-        log.info(f"\n[DRY RUN] Would create {len(all_events)} events total.")
+        _info(f"[DRY RUN] Would create {len(all_events)} events total")
 
 
 if __name__ == "__main__":
