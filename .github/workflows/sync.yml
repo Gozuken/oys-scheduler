@@ -1,0 +1,60 @@
+name: OYS → Google Calendar Sync
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # every day at 06:00 UTC (09:00 Istanbul)
+  workflow_dispatch:        # also allows manual trigger from GitHub UI
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install requests beautifulsoup4 groq pypdf \
+            google-auth google-auth-oauthlib google-api-python-client \
+            python-dotenv tzdata
+
+      - name: Write credentials and token from secrets
+        run: |
+          echo "${{ secrets.GOOGLE_CREDENTIALS_JSON }}" | base64 -d > credentials.json
+          echo "${{ secrets.GOOGLE_TOKEN_JSON }}"       | base64 -d > token.json
+
+      - name: Restore persistent state (seen events + PDF choices)
+        uses: actions/cache@v4
+        with:
+          path: |
+            seen_events.json
+            pdf_choices.json
+            pdf_cache/
+          key: oys-state-${{ runner.os }}
+          restore-keys: oys-state-
+
+      - name: Run sync
+        env:
+          OYS_USERNAME:    ${{ secrets.OYS_USERNAME }}
+          OYS_PASSWORD:    ${{ secrets.OYS_PASSWORD }}
+          GROQ_API_KEY:    ${{ secrets.GROQ_API_KEY }}
+          STUDENT_NAME:    ${{ secrets.STUDENT_NAME }}
+          STUDENT_NUMBER:  ${{ secrets.STUDENT_NUMBER }}
+        run: python moodle_to_calendar.py
+
+      - name: Save persistent state
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: |
+            seen_events.json
+            pdf_choices.json
+            pdf_cache/
+          key: oys-state-${{ runner.os }}-${{ github.run_id }}
