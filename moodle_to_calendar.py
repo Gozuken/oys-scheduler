@@ -100,13 +100,15 @@ class MoodleScraper:
         h1   = soup.find("h1")
         course_name = h1.get_text(strip=True) if h1 else f"Course {course_id}"
 
-        activities, pdf_links = [], []
+        activities, pdf_links, section_summaries = [], [], []
 
         for section in soup.select("li.section.course-section"):
             week_el  = section.find("h3", class_="sectionname")
             week     = week_el.get_text(strip=True) if week_el else "General"
             summ_div = section.find("div", class_="summarytext")
             section_info = summ_div.get_text(separator=" ", strip=True) if summ_div else ""
+            if section_info:
+                section_summaries.append({"week": week, "text": section_info})
 
             for activity in section.select("li.activity"):
                 name_el = activity.find("span", class_="instancename")
@@ -152,10 +154,11 @@ class MoodleScraper:
 
         log.info(f"  -> {course_name}: {len(activities)} activities, {len(pdf_links)} PDFs")
         return {
-            "course_id":   course_id,
-            "course_name": course_name,
-            "activities":  activities,
-            "pdf_links":   pdf_links,
+            "course_id":        course_id,
+            "course_name":      course_name,
+            "activities":       activities,
+            "pdf_links":        pdf_links,
+            "section_summaries": section_summaries,
         }
 
     def scrape_all_courses(self) -> list[dict]:
@@ -237,9 +240,14 @@ Always return valid JSON arrays only. No markdown, no explanation."""
 def build_course_prompt(course: dict, pdf_texts: list[dict], student_name: str, student_number: str) -> str:
     today = datetime.now(ZoneInfo(TIMEZONE)).strftime("%A, %d %B %Y")
 
-    # Format activities
-    relevant = [a for a in course["activities"] if a.get("due") or a.get("opened")]
-    activities_text = json.dumps(relevant, ensure_ascii=False, indent=2) if relevant else "None"
+    # Format activities — send all, AI decides what's relevant
+    activities_text = json.dumps(course["activities"], ensure_ascii=False, indent=2) if course["activities"] else "None"
+
+    # Section summaries often contain quiz schedules, grading info, announcements
+    summaries = course.get("section_summaries", [])
+    summaries_text = "\n\n".join(
+        f"[{s['week']}]\n{s['text']}" for s in summaries if s["text"]
+    ) if summaries else "None"
 
     # Format PDF texts
     if pdf_texts:
@@ -278,6 +286,9 @@ Return ONLY a valid JSON array, no markdown, no extra text.
 --- COURSE ACTIVITIES ---
 {activities_text}
 
+--- SECTION ANNOUNCEMENTS / SUMMARIES ---
+{summaries_text}
+
 --- COURSE PDFs ---
 {pdfs_text}
 """
@@ -312,20 +323,54 @@ def parse_course_with_groq(course: dict, pdf_texts: list[dict],
 
 
 
-# Keywords in PDF names that indicate lecture content (not useful for calendar)
-# Using allowlist instead: only send PDFs whose names suggest scheduling/admin content
-USEFUL_PDF_KEYWORDS = [
-    "syllabus", "izlence", "icerik", "içerik", "program",
-    "lab", "schedule", "group", "grup", "proje", "project",
-    "rules", "kural", "odev", "ödev", "assignment",
-    "exam", "sinav", "sınav", "midterm", "final",
-    "preliminary", "on hazirlik", "ön hazırlık",
-]
+def ai_filter_pdfs(pdf_links: list[dict], course_name: str,
+                   choices: dict, client: Groq) -> list[dict]:
+    """Ask Groq to classify PDF names; skip any already cached in choices."""
+    if not pdf_links:
+        return []
 
-def is_useful_pdf(name: str) -> bool:
-    """Only send PDFs whose names suggest they contain scheduling or admin info."""
-    name_lower = name.lower()
-    return any(kw in name_lower for kw in USEFUL_PDF_KEYWORDS)
+    # Only classify PDFs we haven't seen before
+    unknown = [p for p in pdf_links if p["view_url"] not in choices]
+
+    if unknown:
+        names_list = "\n".join(
+            f"{i+1}. {p['name']}" for i, p in enumerate(unknown)
+        )
+        prompt = (
+            f"Course: {course_name}\n"
+            f"Below are PDF file names attached to a university course page.\n"
+            f"Return ONLY a JSON array of the numbers (1-based) of PDFs that are likely "
+            f"to contain scheduling or admin info useful for a calendar — such as syllabi, "
+            f"lab schedules, assignment sheets, exam dates, group schedules, or project rules.\n"
+            f"Exclude pure lecture slides, lecture notes, or reading material.\n"
+            f"Return [] if none qualify. No explanation, only the JSON array.\n\n"
+            f"{names_list}"
+        )
+        try:
+            resp = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=256,
+            )
+            raw = resp.choices[0].message.content.strip()
+            raw = re.sub(r"^```[a-z]*\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw)
+            selected = set(json.loads(raw)) if raw != "[]" else set()
+        except Exception as e:
+            log.warning(f"  AI PDF filter failed ({e}); including all unknown PDFs as fallback")
+            selected = set(range(1, len(unknown) + 1))
+
+        for i, p in enumerate(unknown):
+            choices[p["view_url"]] = ((i + 1) in selected)
+        save_pdf_choices(choices)
+        log.info(f"  AI classified {len(unknown)} new PDFs, kept {len(selected)}")
+
+    useful = [p for p in pdf_links if choices.get(p["view_url"], False)]
+    skipped = len(pdf_links) - len(useful)
+    if skipped:
+        log.info(f"  Skipping {skipped} lecture PDFs (cached), downloading {len(useful)} useful PDFs")
+    return useful
 
 
 def _parse_json_response(text: str) -> list[dict]:
@@ -543,12 +588,7 @@ def main():
                 useful = pick_pdfs_interactively(course["course_name"], course["pdf_links"], pdf_choices)
                 log.info(f"  Downloading {len(useful)} selected PDFs...")
             else:
-                useful = [p for p in course["pdf_links"] if is_useful_pdf(p["name"])]
-                skipped = len(course["pdf_links"]) - len(useful)
-                if skipped:
-                    log.info(f"  Skipping {skipped} lecture/slide PDFs, downloading {len(useful)} useful PDFs...")
-                else:
-                    log.info(f"  Downloading {len(useful)} PDFs...")
+                useful = ai_filter_pdfs(course["pdf_links"], course["course_name"], pdf_choices, client)
             for pdf_info in useful:
                 pdf_bytes = scraper.get_cached_pdf(pdf_info["view_url"])
                 if pdf_bytes:
