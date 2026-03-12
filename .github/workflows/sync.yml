@@ -49,6 +49,14 @@ jobs:
           STUDENT_NUMBER:  ${{ secrets.STUDENT_NUMBER }}
         run: python moodle_to_calendar.py
 
+      - name: Update Google token secret (keeps it fresh)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          NEW_TOKEN=$(base64 -w 0 token.json)
+          gh secret set GOOGLE_TOKEN_JSON --body "$NEW_TOKEN" --repo ${{ github.repository }}
+
       - name: Save persistent state
         uses: actions/cache/save@v4
         if: always()
