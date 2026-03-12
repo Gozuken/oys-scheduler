@@ -74,6 +74,8 @@ class MoodleScraper:
         self.session.headers.update({"User-Agent": "Mozilla/5.0"})
         self.username = username
         self.password = password
+        self.sesskey: str | None = None
+        self.userid:  int | None = None
 
     def login(self) -> bool:
         log.info("Logging in to OYS...")
@@ -89,6 +91,15 @@ class MoodleScraper:
         })
         if "Log out" in r.text or "\u00c7\u0131k\u0131\u015f" in r.text:
             log.info("Login successful")
+            # Extract sesskey and userid from the post-login page JS config
+            sk = re.search(r'"sesskey"\s*:\s*"([^"]+)"', r.text)
+            uid = re.search(r'"userId"\s*:\s*(\d+)', r.text)
+            self.sesskey = sk.group(1)  if sk  else None
+            self.userid  = int(uid.group(1)) if uid else None
+            if self.sesskey:
+                log.info(f"  sesskey extracted, userid={self.userid}")
+            else:
+                log.warning("  sesskey not found in page — message fetching will be skipped")
             return True
         log.error("Login failed - check credentials.")
         return False
@@ -210,6 +221,88 @@ class MoodleScraper:
             cache_path.write_bytes(data)
         return data
 
+    def _ajax(self, payload: list) -> list:
+        """POST to the Moodle AJAX endpoint; returns the parsed response list."""
+        url = f"{BASE_URL}/lib/ajax/service.php"
+        r   = self.session.post(url, params={"sesskey": self.sesskey}, json=payload, timeout=15)
+        r.raise_for_status()
+        return r.json()
+
+    def get_recent_messages(self, days: int = 30) -> list[dict]:
+        """
+        Return recent inbox messages as plain-text dicts.
+        Fetches all conversations then pulls messages from each.
+        Only returns messages newer than `days` days.
+        """
+        if not self.sesskey or not self.userid:
+            log.warning("  Skipping messages: sesskey/userid not available")
+            return []
+
+        cutoff = datetime.now(ZoneInfo(TIMEZONE)).timestamp() - days * 86400
+
+        # Step 1: get all conversations
+        try:
+            resp = self._ajax([{
+                "index": 0,
+                "methodname": "core_message_get_conversations",
+                "args": {
+                    "userid":     self.userid,
+                    "type":       1,          # 1 = individual DMs
+                    "limitnum":   50,
+                    "limitfrom":  0,
+                    "favourites": False,
+                    "mergeself":  True,
+                },
+            }])
+            conversations = resp[0]["data"]["conversations"]
+        except Exception as e:
+            log.warning(f"  Failed to fetch conversations: {e}")
+            return []
+
+        log.info(f"  Found {len(conversations)} conversations, fetching recent messages...")
+
+        all_messages = []
+        for conv in conversations:
+            conv_id      = conv["id"]
+            other_member = next((m for m in conv["members"] if m["id"] != self.userid), None)
+            other_name   = other_member["fullname"] if other_member else "Unknown"
+
+            try:
+                resp = self._ajax([{
+                    "index": 0,
+                    "methodname": "core_message_get_conversation_messages",
+                    "args": {
+                        "currentuserid": self.userid,
+                        "convid":        conv_id,
+                        "newest":        True,
+                        "limitnum":      50,
+                        "limitfrom":     0,
+                    },
+                }])
+                messages = resp[0]["data"]["messages"]
+            except Exception as e:
+                log.warning(f"  Failed to fetch messages for conv {conv_id}: {e}")
+                continue
+
+            for msg in messages:
+                if msg["timecreated"] < cutoff:
+                    continue
+                # Strip HTML tags from message text
+                plain = re.sub(r"<[^>]+>", " ", msg["text"]).strip()
+                plain = re.sub(r"\s+", " ", plain)
+                if not plain:
+                    continue
+                all_messages.append({
+                    "from":        other_name if msg["useridfrom"] != self.userid else "Me",
+                    "to":          "Me"        if msg["useridfrom"] != self.userid else other_name,
+                    "text":        plain,
+                    "timecreated": msg["timecreated"],
+                    "date":        datetime.fromtimestamp(msg["timecreated"], ZoneInfo(TIMEZONE)).strftime("%d %B %Y %H:%M"),
+                })
+
+        log.info(f"  Fetched {len(all_messages)} recent messages (last {days} days)")
+        return all_messages
+
 
 # ── PDF Text Extraction ───────────────────────────────────────────────────────
 
@@ -237,7 +330,8 @@ only create events relevant to THIS student, not other groups or sections.
 Always return valid JSON arrays only. No markdown, no explanation."""
 
 
-def build_course_prompt(course: dict, pdf_texts: list[dict], student_name: str, student_number: str) -> str:
+def build_course_prompt(course: dict, pdf_texts: list[dict], student_name: str, student_number: str,
+                         messages: list[dict] | None = None) -> str:
     today = datetime.now(ZoneInfo(TIMEZONE)).strftime("%A, %d %B %Y")
 
     # Format activities — send all, AI decides what's relevant
@@ -248,6 +342,14 @@ def build_course_prompt(course: dict, pdf_texts: list[dict], student_name: str, 
     summaries_text = "\n\n".join(
         f"[{s['week']}]\n{s['text']}" for s in summaries if s["text"]
     ) if summaries else "None"
+
+    # Format recent messages from instructors
+    if messages:
+        msgs_text = "\n\n".join(
+            f"[{m['date']} | From: {m['from']}]\n{m['text']}" for m in messages
+        )
+    else:
+        msgs_text = "None"
 
     # Format PDF texts
     if pdf_texts:
@@ -289,6 +391,9 @@ Return ONLY a valid JSON array, no markdown, no extra text.
 --- SECTION ANNOUNCEMENTS / SUMMARIES ---
 {summaries_text}
 
+--- RECENT INSTRUCTOR MESSAGES ---
+{msgs_text}
+
 --- COURSE PDFs ---
 {pdfs_text}
 """
@@ -296,8 +401,8 @@ Return ONLY a valid JSON array, no markdown, no extra text.
 
 def parse_course_with_groq(course: dict, pdf_texts: list[dict],
                             student_name: str, student_number: str,
-                            client: Groq) -> list[dict]:
-    prompt = build_course_prompt(course, pdf_texts, student_name, student_number)
+                            client: Groq, messages: list[dict] | None = None) -> list[dict]:
+    prompt = build_course_prompt(course, pdf_texts, student_name, student_number, messages)
 
     log.info(f"  Sending to Groq: {course['course_name']}")
     try:
@@ -574,6 +679,10 @@ def main():
         raise ValueError("Set GROQ_API_KEY in .env  (free at https://console.groq.com)")
     client = Groq(api_key=groq_key)
 
+    # Fetch recent messages once — passed to every course prompt as extra context
+    log.info("Fetching recent messages...")
+    recent_messages = scraper.get_recent_messages(days=30)
+
     all_events = []
     pdf_choices = load_pdf_choices()  # persistent across runs
 
@@ -601,12 +710,13 @@ def main():
 
         # Skip course if nothing to process
         has_dated_activities = any(a.get("due") or a.get("opened") for a in course["activities"])
-        if not has_dated_activities and not pdf_texts:
+        has_summaries        = bool(course.get("section_summaries"))
+        if not has_dated_activities and not pdf_texts and not has_summaries and not recent_messages:
             log.info(f"  Nothing to process for {course['course_name']}, skipping.")
             continue
 
         # Send to Groq
-        events = parse_course_with_groq(course, pdf_texts, student_name, student_number, client)
+        events = parse_course_with_groq(course, pdf_texts, student_name, student_number, client, recent_messages)
         all_events.extend(events)
 
     log.info(f"\nTotal events across all courses: {len(all_events)}")
