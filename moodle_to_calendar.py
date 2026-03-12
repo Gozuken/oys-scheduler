@@ -51,8 +51,9 @@ TIMEZONE   = "Europe/Istanbul"
 SCOPES     = ["https://www.googleapis.com/auth/calendar"]
 TOKEN_FILE = "token.json"
 CREDS_FILE = "credentials.json"
-SEEN_FILE  = "seen_events.json"
-PDF_CACHE  = "pdf_cache"
+SEEN_FILE        = "seen_events.json"
+PDF_CACHE        = "pdf_cache"
+PDF_CHOICES_FILE = "pdf_choices.json"
 
 GROQ_MODEL     = "llama-3.3-70b-versatile"
 MAX_PDF_CHARS  = 12000   # truncate very long PDFs to stay within token limits
@@ -426,25 +427,53 @@ def create_calendar_events(events: list[dict], dry_run: bool = False) -> int:
     return created
 
 
-def pick_pdfs_interactively(course_name: str, pdf_links: list[dict]) -> list[dict]:
-    """Show a numbered list of PDFs and let the user choose which to download."""
+def load_pdf_choices() -> dict:
+    """Load saved per-URL PDF include/exclude choices."""
+    if Path(PDF_CHOICES_FILE).exists():
+        with open(PDF_CHOICES_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_pdf_choices(choices: dict):
+    with open(PDF_CHOICES_FILE, "w") as f:
+        json.dump(choices, f, indent=2, ensure_ascii=False)
+
+
+def pick_pdfs_interactively(course_name: str, pdf_links: list[dict],
+                             choices: dict) -> list[dict]:
+    """Prompt only for PDFs not yet decided; reuse saved choices for the rest."""
     if not pdf_links:
         return []
-    print(f"\n  PDFs for: {course_name}")
-    for i, p in enumerate(pdf_links, 1):
-        print(f"    [{i}] {p['name']}  ({p.get('file_type','PDF')})")
-    print(f"    [0] Skip all")
-    raw = input("  Select PDFs (e.g. 1 3 4, or 0 to skip): ").strip()
-    if not raw or raw == "0":
-        return []
-    chosen = []
-    for tok in raw.split():
-        try:
-            idx = int(tok)
-            if 1 <= idx <= len(pdf_links):
-                chosen.append(pdf_links[idx - 1])
-        except ValueError:
-            pass
+
+    new_pdfs = [p for p in pdf_links if p["view_url"] not in choices]
+
+    if new_pdfs:
+        print(f"\n  PDFs for: {course_name}  (new — not yet decided)")
+        for i, p in enumerate(new_pdfs, 1):
+            print(f"    [{i}] {p['name']}  ({p.get('file_type', 'PDF')})")
+        print(f"    [0] Skip all new")
+        raw = input("  Select PDFs to INCLUDE (e.g. 1 3, or 0 to skip all): ").strip()
+
+        selected_indices: set[int] = set()
+        if raw and raw != "0":
+            for tok in raw.split():
+                try:
+                    idx = int(tok)
+                    if 1 <= idx <= len(new_pdfs):
+                        selected_indices.add(idx - 1)
+                except ValueError:
+                    pass
+
+        for i, p in enumerate(new_pdfs):
+            choices[p["view_url"]] = (i in selected_indices)
+        save_pdf_choices(choices)
+        log.info(f"  Choices saved to {PDF_CHOICES_FILE}")
+
+    chosen = [p for p in pdf_links if choices.get(p["view_url"], False)]
+    skipped = len(pdf_links) - len(chosen)
+    if skipped:
+        log.info(f"  {len(chosen)} included, {skipped} skipped (saved choices)")
     return chosen
 
 
@@ -457,7 +486,8 @@ def main():
     parser.add_argument("--no-ai",       action="store_true", help="Print raw scraped data only")
     parser.add_argument("--no-pdfs",     action="store_true", help="Skip PDF downloading and parsing")
     parser.add_argument("--pick-pdfs",   action="store_true", help="Interactively choose which PDFs to use per course")
-    parser.add_argument("--clear-cache", action="store_true", help="Re-download all PDFs")
+    parser.add_argument("--clear-cache",   action="store_true", help="Re-download all PDFs")
+    parser.add_argument("--reset-choices", action="store_true", help="Forget all saved PDF include/exclude choices")
     args = parser.parse_args()
 
     # Load credentials
@@ -475,6 +505,10 @@ def main():
         import shutil
         shutil.rmtree(PDF_CACHE, ignore_errors=True)
         log.info("PDF cache cleared.")
+
+    if args.reset_choices:
+        Path(PDF_CHOICES_FILE).unlink(missing_ok=True)
+        log.info("PDF choices reset — you will be asked again on next run.")
 
     # 1. Scrape all courses
     scraper = MoodleScraper(username, password)
@@ -496,6 +530,7 @@ def main():
     client = Groq(api_key=groq_key)
 
     all_events = []
+    pdf_choices = load_pdf_choices()  # persistent across runs
 
     # 3. Process each course separately
     for course in courses:
@@ -505,7 +540,7 @@ def main():
         pdf_texts = []
         if not args.no_pdfs and course["pdf_links"]:
             if args.pick_pdfs:
-                useful = pick_pdfs_interactively(course["course_name"], course["pdf_links"])
+                useful = pick_pdfs_interactively(course["course_name"], course["pdf_links"], pdf_choices)
                 log.info(f"  Downloading {len(useful)} selected PDFs...")
             else:
                 useful = [p for p in course["pdf_links"] if is_useful_pdf(p["name"])]
