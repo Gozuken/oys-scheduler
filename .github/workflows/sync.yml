@@ -2,7 +2,7 @@ name: OYS → Google Calendar Sync
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # every day at 06:00 UTC (09:00 Istanbul)
+  - cron: "0 20 * * *"   # every day at 23:00 Istanbul (20:00 UTC) 
   workflow_dispatch:        # also allows manual trigger from GitHub UI
 
 jobs:
