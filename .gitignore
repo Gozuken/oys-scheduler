@@ -1,5 +1,7 @@
 .env
 token.json
 seen_events.json
+findings_cache.json
+pdf_choices.json
 credentials.json
 pdf_cache/

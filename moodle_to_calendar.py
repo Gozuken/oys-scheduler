@@ -29,6 +29,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
+import time
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from groq import Groq
@@ -54,9 +55,10 @@ CREDS_FILE = "credentials.json"
 SEEN_FILE        = "seen_events.json"
 PDF_CACHE        = "pdf_cache"
 PDF_CHOICES_FILE = "pdf_choices.json"
+FINDINGS_CACHE_FILE = "findings_cache.json"
 
 GROQ_MODEL     = "llama-3.3-70b-versatile"
-MAX_PDF_CHARS  = 12000   # truncate very long PDFs to stay within token limits
+MAX_PDF_CHARS  = 8000   # Reduced from 12000 to avoid TPM limits on free tier
 
 COURSE_IDS = [10818, 10747, 10289, 10546, 9843, 10164, 5439]
 
@@ -154,13 +156,23 @@ class MoodleScraper:
             "username": self.username, "password": self.password,
             "logintoken": tok["value"], "anchor": "",
         })
-        if "Log out" in r.text or "\u00c7\u0131k\u0131\u015f" in r.text:
+        
+        # Check if login was successful
+        if "Log out" in r.text or "\u00c7\u0131k\u0131\u015f" in r.text or "sesskey" in r.text:
             _ok("Login successful")
-            # Extract sesskey and userid from the post-login page JS config
-            sk = re.search(r'"sesskey"\s*:\s*"([^"]+)"', r.text)
-            uid = re.search(r'"userId"\s*:\s*(\d+)', r.text)
-            self.sesskey = sk.group(1)  if sk  else None
-            self.userid  = int(uid.group(1)) if uid else None
+            
+            # Extract sesskey and userid from JS config or HTML
+            sk_match = re.search(r'"sesskey"\s*:\s*"([^"]+)"', r.text)
+            uid_match = re.search(r'"userId"\s*:\s*(\d+)', r.text)
+            
+            if not sk_match:
+                sk_match = re.search(r'sesskey=([^"&]+)', r.text)
+            if not uid_match:
+                uid_match = re.search(r'/user/profile\.php\?id=(\d+)', r.text)
+
+            self.sesskey = sk_match.group(1)  if sk_match  else None
+            self.userid  = int(uid_match.group(1)) if uid_match else None
+            
             if self.sesskey:
                 _info(f"sesskey extracted  ·  userid={self.userid}")
             else:
@@ -181,10 +193,22 @@ class MoodleScraper:
         for section in soup.select("li.section.course-section"):
             week_el  = section.find("h3", class_="sectionname")
             week     = week_el.get_text(strip=True) if week_el else "General"
+            
+            # Try to extract dates from section name (e.g. "24 February - 2 March")
+            # This helps the AI resolve "Week 3" or relative dates.
+            section_dates = ""
+            date_match = re.search(r"(\d+\s+[A-Za-z]+\s*-\s*\d+\s+[A-Za-z]+)", week)
+            if date_match:
+                section_dates = date_match.group(1)
+
             summ_div = section.find("div", class_="summarytext")
             section_info = summ_div.get_text(separator=" ", strip=True) if summ_div else ""
-            if section_info:
-                section_summaries.append({"week": week, "text": section_info})
+            if section_info or section_dates:
+                section_summaries.append({
+                    "week": week, 
+                    "dates": section_dates,
+                    "text": section_info
+                })
 
             for activity in section.select("li.activity"):
                 name_el = activity.find("span", class_="instancename")
@@ -206,7 +230,7 @@ class MoodleScraper:
                     if badge_text not in ("RAR", "ZIP", "7Z", "TAR", "GZ"):
                         pdf_links.append({
                             "name": activity_name, "file_type": badge_text,
-                            "view_url": link, "week": week,
+                            "view_url": link, "week": week, "section_dates": section_dates
                         })
 
                 opened = due = None
@@ -386,110 +410,214 @@ def extract_pdf_text(pdf_bytes: bytes, max_chars: int = MAX_PDF_CHARS) -> str:
         return ""
 
 
-# ── Groq Parser ───────────────────────────────────────────────────────────────
+def load_findings_cache() -> dict:
+    if Path(FINDINGS_CACHE_FILE).exists():
+        with open(FINDINGS_CACHE_FILE) as f:
+            return json.load(f)
+    return {}
 
-SYSTEM_PROMPT = """You are a university student assistant that creates Google Calendar events.
-You receive course data including activities and PDF content.
-You use the student's name and number to filter group/section assignments — 
-only create events relevant to THIS student, not other groups or sections.
-Always return valid JSON arrays only. No markdown, no explanation."""
+def save_findings_cache(cache: dict):
+    with open(FINDINGS_CACHE_FILE, "w") as f:
+        json.dump(cache, f, indent=2, ensure_ascii=False)
 
+def get_content_hash(content: str | dict | list) -> str:
+    if not isinstance(content, str):
+        content = json.dumps(content, sort_keys=True)
+    return hashlib.md5(content.encode()).hexdigest()
 
-def build_course_prompt(course: dict, pdf_texts: list[dict], student_name: str, student_number: str,
-                         messages: list[dict] | None = None) -> str:
-    today = datetime.now(ZoneInfo(TIMEZONE)).strftime("%A, %d %B %Y")
+# ── Groq Parser (Multi-Stage Reasoning) ──────────────────────────────────────
 
-    # Format activities — send all, AI decides what's relevant
-    activities_text = json.dumps(course["activities"], ensure_ascii=False, indent=2) if course["activities"] else "None"
+EXTRACTION_SYSTEM_PROMPT = """You are an expert academic event extractor.
+Your task is to find ALL potential calendar events (exams, quizzes, deadlines, project rules, lab schedules).
+For each event found, provide:
+- name
+- date/time info (even if vague, e.g., 'Week 5')
+- requirements or description
+- mention of specific student groups or sections if any
 
-    # Section summaries often contain quiz schedules, grading info, announcements
-    summaries = course.get("section_summaries", [])
-    summaries_text = "\n\n".join(
-        f"[{s['week']}]\n{s['text']}" for s in summaries if s["text"]
-    ) if summaries else "None"
+Return a JSON array of objects. No explanation."""
 
-    # Format recent messages from instructors
-    if messages:
-        msgs_text = "\n\n".join(
-            f"[{m['date']} | From: {m['from']}]\n{m['text']}" for m in messages
-        )
-    else:
-        msgs_text = "None"
+RECONCILIATION_SYSTEM_PROMPT = """You are a highly analytical student assistant.
+You will receive 'Findings' from multiple sources (PDFs, Moodle, Announcements).
+Your goal is to RECONCILE these into a single, accurate Google Calendar.
 
-    # Format PDF texts
-    if pdf_texts:
-        pdfs_text = "\n\n".join(
-            f"=== PDF: {p['name']} ===\n{p['text']}" for p in pdf_texts if p["text"]
-        )
-    else:
-        pdfs_text = "None"
+LOGIC:
+1. MATCHING: If Source A says 'Quiz 1' is in 'Week 4' and Source B (Syllabus) says 'Week 4' is 'March 10-16', create the event for March 10.
+2. DEDUPLICATION: Merge findings about the same event.
+3. PERSONALIZATION: Use the Student Profile to only include events for their specific section/group.
+4. VALIDATION: Ensure dates are valid and in the future.
 
-    return f"""STUDENT PROFILE:
-  Name: {student_name}
-  Student Number: {student_number}
+Output a valid JSON array of final calendar events only. No markdown."""
 
-COURSE: {course["course_name"]}
-Today: {today} | Timezone: {TIMEZONE} (UTC+3)
-
-INSTRUCTIONS:
-- Create Google Calendar events for this course only
-- If a PDF contains a group/section/lab schedule, find the student by name or number
-  and ONLY create the event for their specific day/time — skip all other groups
-- Extract exam dates, assignment due dates, project deadlines, grading policy from PDFs
-- Moodle dates look like "Friday, 6 March 2026, 11:59 PM"
-
-For each event return a JSON object with EXACTLY:
-- summary: e.g. "MAT286 Odev-1 Due" or "BIL332 Lab-1 Due"
-- description: details including requirements, topics, grading weight, link
-- start_datetime: ISO 8601 with +03:00 offset e.g. "2026-03-06T23:59:00+03:00"
-- end_datetime: ISO 8601, 1 hour after start (2 hours for exams)
-- reminder_minutes: [10080, 1440, 180] for exams | [1440, 360, 60] for deadlines | [1440] for info
-- color_id: "6" for exams | "11" for deadlines | "3" for grading/info | "5" for office hours
-- unique_key: lowercase no-spaces e.g. "mat286_odev1_due" or "bil332_lab1_sec1"
-
-Return [] if there is nothing relevant to calendar for this student.
-Return ONLY a valid JSON array, no markdown, no extra text.
-
---- COURSE ACTIVITIES ---
-{activities_text}
-
---- SECTION ANNOUNCEMENTS / SUMMARIES ---
-{summaries_text}
-
---- RECENT INSTRUCTOR MESSAGES ---
-{msgs_text}
-
---- COURSE PDFs ---
-{pdfs_text}
-"""
-
+def call_groq_safe(client: Groq, system: str, user: str, retries: int = 3) -> str:
+    """Call Groq with retry logic for rate limits (429)."""
+    for i in range(retries):
+        try:
+            time.sleep(1.5) # Minimum spacing
+            resp = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                temperature=0.0,
+                max_tokens=4096,
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            if "429" in str(e) and i < retries - 1:
+                wait_time = 30 * (i + 1)
+                _warn(f"Rate limit hit (429). Waiting {wait_time}s before retry {i+1}/{retries}...")
+                time.sleep(wait_time)
+                continue
+            _warn(f"Groq error: {e}")
+            return "[]"
+    return "[]"
 
 def parse_course_with_groq(course: dict, pdf_texts: list[dict],
                             student_name: str, student_number: str,
                             client: Groq, messages: list[dict] | None = None) -> list[dict]:
-    prompt = build_course_prompt(course, pdf_texts, student_name, student_number, messages)
+    today = datetime.now(ZoneInfo(TIMEZONE)).strftime("%A, %d %B %Y")
+    course_header = f"COURSE: {course['course_name']} (ID: {course['course_id']})\nTODAY: {today}\nSTUDENT: {student_name} ({student_number})"
+    
+    cache = load_findings_cache()
+    findings = []
 
-    _info(f"Sending to Groq...")
-    try:
-        response = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": prompt},
-            ],
-            temperature=0.1,
-            max_tokens=4096,
-        )
-        raw    = response.choices[0].message.content
-        events = _parse_json_response(raw)
-        # Tag each event with course info for debugging
-        for ev in events:
-            ev.setdefault("course", course["course_name"])
-        _ok(f"{len(events)} events extracted")
-        return events
-    except Exception as e:
-        _err(f"Groq failed: {e}")
+    # 1. Analyze each PDF individually (with section context)
+    for pdf in pdf_texts:
+        content_hash = get_content_hash(pdf['text'])
+        # Key includes week/section because a PDF might have different meaning depending on where it's posted
+        cache_key = f"pdf_{pdf['name']}_{pdf.get('week', 'Gen')}_{content_hash}"
+        
+        if cache_key in cache:
+            _info(f"Using cached findings for PDF: {pdf['name']}")
+            findings.append({"source": f"PDF: {pdf['name']} (from {pdf.get('week', 'Gen')})", "data": cache[cache_key]})
+        else:
+            _info(f"Extracting findings from PDF: {pdf['name']} (from {pdf.get('week', 'General')})...")
+            user_prompt = f"{course_header}\n\nSOURCE: PDF '{pdf['name']}' found in section '{pdf.get('week', 'General')}'\n\nCONTENT:\n{pdf['text']}"
+            raw = call_groq_safe(client, EXTRACTION_SYSTEM_PROMPT, user_prompt)
+            data = _parse_json_response(raw)
+            findings.append({"source": f"PDF: {pdf['name']} (from {pdf.get('week', 'Gen')})", "data": data})
+            cache[cache_key] = data
+
+    # 2. Analyze Activities in small chunks
+    acts = course["activities"]
+    chunk_size = 40
+    for i in range(0, len(acts), chunk_size):
+        chunk = acts[i:i+chunk_size]
+        content_hash = get_content_hash(chunk)
+        cache_key = f"acts_{course['course_id']}_{i}_{content_hash}"
+        
+        if cache_key in cache:
+            findings.append({"source": f"Activities Batch {i//chunk_size+1}", "data": cache[cache_key]})
+        else:
+            _info(f"Extracting findings from activities batch {i//chunk_size + 1}...")
+            user_prompt = f"{course_header}\n\nSOURCE: Moodle Activities Batch\n\nCONTENT:\n{json.dumps(chunk, ensure_ascii=False)}"
+            raw = call_groq_safe(client, EXTRACTION_SYSTEM_PROMPT, user_prompt)
+            data = _parse_json_response(raw)
+            findings.append({"source": f"Activities Batch {i//chunk_size+1}", "data": data})
+            cache[cache_key] = data
+
+    # 3. Analyze Announcements
+    summ_hash = get_content_hash(course.get("section_summaries", []))
+    cache_key = f"announcements_{course['course_id']}_{summ_hash}"
+    if summ_hash != get_content_hash([]):
+        if cache_key in cache:
+            findings.append({"source": "Announcements", "data": cache[cache_key]})
+        else:
+            _info(f"Extracting findings from announcements...")
+            user_prompt = f"{course_header}\n\nSOURCE: Section Announcements\n\nCONTENT:\n{json.dumps(course['section_summaries'], ensure_ascii=False)}"
+            raw = call_groq_safe(client, EXTRACTION_SYSTEM_PROMPT, user_prompt)
+            data = _parse_json_response(raw)
+            findings.append({"source": "Announcements", "data": data})
+            cache[cache_key] = data
+
+    # 4. Filter and add relevant instructor messages
+    from moodle_to_calendar import filter_messages_for_course
+    rel_msgs = filter_messages_for_course(course, messages or [])
+    if rel_msgs:
+        msg_hash = get_content_hash(rel_msgs)
+        cache_key = f"messages_{course['course_id']}_{msg_hash}"
+        if cache_key in cache:
+            findings.append({"source": "Messages", "data": cache[cache_key]})
+        else:
+            _info(f"Extracting findings from messages...")
+            user_prompt = f"{course_header}\n\nSOURCE: Instructor Messages\n\nCONTENT:\n{json.dumps(rel_msgs, ensure_ascii=False)}"
+            raw = call_groq_safe(client, EXTRACTION_SYSTEM_PROMPT, user_prompt)
+            data = _parse_json_response(raw)
+            findings.append({"source": "Messages", "data": data})
+            cache[cache_key] = data
+
+    save_findings_cache(cache)
+
+    # 5. Final Reconciliation (The "Brain")
+    _info(f"Reconciling {len(findings)} sources for {course['course_name']}...")
+    week_ref = "\n".join([f"- {s['week']}: {s.get('dates', 'Unknown')}" for s in course.get("section_summaries", [])])
+    
+    recon_prompt = f"""{course_header}
+
+WEEK TO DATE REFERENCE (Crucial for resolving 'Week X' mentions):
+{week_ref}
+
+RAW FINDINGS FROM ALL SOURCES:
+{json.dumps(findings, ensure_ascii=False, indent=2)}
+
+FINAL TASK:
+You are the central coordinator. Cross-reference all findings to build a final schedule.
+- LINKING: If an activity name is 'Quiz 1' and a PDF source says 'Quiz 1 is May 5', that is the date.
+- INFERENCE: If an announcement says 'Exam next Monday' and the announcement is in a section dated 'March 9-15', the date is Monday, March 16.
+- HIERARCHY: Trust specific dates (e.g. 'March 10') over relative ones (e.g. 'Next Week') if they conflict.
+- FORMAT: Provide a JSON array of objects with: summary, description, start_datetime, end_datetime, reminder_minutes, color_id, unique_key.
+- UNIQUE KEY: Use a stable, descriptive key (e.g., 'mat286_midterm_2026').
+
+Return ONLY the JSON array.
+"""
+    final_raw = call_groq_safe(client, RECONCILIATION_SYSTEM_PROMPT, recon_prompt)
+    events = _parse_json_response(final_raw)
+    
+    for ev in events:
+        ev.setdefault("course", course["course_name"])
+    
+    _ok(f"Logic complete: {len(events)} events reconciled")
+    return events
+
+
+def filter_messages_for_course(course: dict, messages: list[dict]) -> list[dict]:
+    """Filter global messages to only those that mention this course ID or name."""
+    if not messages:
         return []
+    
+    course_id = str(course["course_id"])
+    course_name_clean = re.sub(r"[^a-zA-Z0-9 ]", " ", course["course_name"]).lower()
+    course_tokens = set(course_name_clean.split())
+    
+    filtered = []
+    for m in messages:
+        text_lower = m["text"].lower()
+        if course_id in text_lower:
+            filtered.append(m)
+            continue
+        for token in course_tokens:
+            if len(token) > 2 and token in text_lower:
+                filtered.append(m)
+                break
+    return filtered
+    """Filter global messages to only those that mention this course ID or name."""
+    if not messages:
+        return []
+    
+    course_id = str(course["course_id"])
+    course_name_clean = re.sub(r"[^a-zA-Z0-9 ]", " ", course["course_name"]).lower()
+    course_tokens = set(course_name_clean.split())
+    
+    filtered = []
+    for m in messages:
+        text_lower = m["text"].lower()
+        if course_id in text_lower:
+            filtered.append(m)
+            continue
+        for token in course_tokens:
+            if len(token) > 2 and token in text_lower:
+                filtered.append(m)
+                break
+    return filtered
 
 
 
@@ -504,17 +632,23 @@ def ai_filter_pdfs(pdf_links: list[dict], course_name: str,
 
     if unknown:
         names_list = "\n".join(
-            f"{i+1}. {p['name']}" for i, p in enumerate(unknown)
+            f"{i+1}. {p['name']} (Located in section: {p.get('week', 'General')})" 
+            for i, p in enumerate(unknown)
         )
         prompt = (
-            f"Course: {course_name}\n"
-            f"Below are PDF file names attached to a university course page.\n"
-            f"Return ONLY a JSON array of the numbers (1-based) of PDFs that are likely "
-            f"to contain scheduling or admin info useful for a calendar — such as syllabi, "
-            f"lab schedules, assignment sheets, exam dates, group schedules, or project rules.\n"
-            f"Exclude pure lecture slides, lecture notes, or reading material.\n"
-            f"Return [] if none qualify. No explanation, only the JSON array.\n\n"
-            f"{names_list}"
+            f"Course: {course_name}\n\n"
+            f"Classify these university course files. We only want files with administrative/scheduling info.\n"
+            f"INCLUDE (likely to have dates/deadlines):\n"
+            f"- Syllabi, Course Outlines, Semester Schedules\n"
+            f"- Lab Manuals/Schedules, Project Descriptions, Assignment Sheets\n"
+            f"- Exam Schedules, Grading Policies\n\n"
+            f"EXCLUDE (likely lecture content/readings):\n"
+            f"- Lecture Slides (e.g., 'Chapter 1', 'Week 2 Notes')\n"
+            f"- Textbook Chapters, Research Papers\n"
+            f"- Problem Sets without due dates (unless they are assignment sheets)\n\n"
+            f"Files to classify:\n{names_list}\n\n"
+            f"Return ONLY a JSON array of the numbers (1-based) of PDFs to INCLUDE. "
+            f"Return [] if none qualify. No explanation."
         )
         try:
             resp = client.chat.completions.create(
@@ -611,8 +745,8 @@ def create_calendar_events(events: list[dict], dry_run: bool = False) -> int:
                 "useDefault": False,
                 "overrides": [
                     {"method": "popup", "minutes": m}
-                    for m in ev.get("reminder_minutes", [1440, 360, 60])
-                    if m > 0
+                    for m in (ev.get("reminder_minutes") if isinstance(ev.get("reminder_minutes"), list) else [1440, 360, 60])
+                    if isinstance(m, int) and m > 0
                 ],
             },
         }
