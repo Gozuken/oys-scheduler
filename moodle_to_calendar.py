@@ -30,6 +30,10 @@ from zoneinfo import ZoneInfo
 
 import requests
 import time
+import groq
+import google.generativeai as genai
+from google.api_core import exceptions as google_exceptions
+from google.rpc import error_details_pb2
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from groq import Groq
@@ -57,8 +61,10 @@ PDF_CACHE        = "pdf_cache"
 PDF_CHOICES_FILE = "pdf_choices.json"
 FINDINGS_CACHE_FILE = "findings_cache.json"
 
-GROQ_MODEL     = "llama-3.3-70b-versatile"
-MAX_PDF_CHARS  = 8000   # Reduced from 12000 to avoid TPM limits on free tier
+GROQ_MODEL      = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GEMINI_MODEL    = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+MAX_PDF_CHARS   = 12000  # Increased since Gemini handles large context better
+MAX_GROQ_TPD    = 100000 # Just for tracking/info
 
 COURSE_IDS = [10818, 10747, 10289, 10546, 9843, 10164, 5439]
 
@@ -412,12 +418,16 @@ def extract_pdf_text(pdf_bytes: bytes, max_chars: int = MAX_PDF_CHARS) -> str:
 
 def load_findings_cache() -> dict:
     if Path(FINDINGS_CACHE_FILE).exists():
-        with open(FINDINGS_CACHE_FILE) as f:
-            return json.load(f)
+        try:
+            with open(FINDINGS_CACHE_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            _warn(f"Corrupted cache file '{FINDINGS_CACHE_FILE}'. Starting fresh.")
+            return {}
     return {}
 
 def save_findings_cache(cache: dict):
-    with open(FINDINGS_CACHE_FILE, "w") as f:
+    with open(FINDINGS_CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(cache, f, indent=2, ensure_ascii=False)
 
 def get_content_hash(content: str | dict | list) -> str:
@@ -449,11 +459,12 @@ LOGIC:
 
 Output a valid JSON array of final calendar events only. No markdown."""
 
-def call_groq_safe(client: Groq, system: str, user: str, retries: int = 3) -> str:
-    """Call Groq with retry logic for rate limits (429)."""
+def call_groq_safe(client: Groq, system: str, user: str, retries: int = 5) -> str:
+    """Call Groq with retry logic for rate limits (429) and temporary errors (500, 503)."""
     for i in range(retries):
         try:
-            time.sleep(1.5) # Minimum spacing
+            # Small jittered spacing to avoid bursty requests
+            time.sleep(1.5 + (i * 0.5)) 
             resp = client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -461,17 +472,130 @@ def call_groq_safe(client: Groq, system: str, user: str, retries: int = 3) -> st
                 max_tokens=4096,
             )
             return resp.choices[0].message.content
+        except groq.RateLimitError as e:
+            # Check for Daily Token Limit (TPD) in error message
+            if "tokens per day (TPD)" in str(e).lower() or "daily limit" in str(e).lower():
+                _warn("Groq Daily Token Limit hit.")
+                raise # Re-raise to let call_llm_safe handle fallback
+
+            if i < retries - 1:
+                retry_after_str = e.response.headers.get("retry-after")
+                try:
+                    wait_time = int(float(retry_after_str)) + 2 if retry_after_str else 30 * (i + 1)
+                except (ValueError, TypeError):
+                    wait_time = 30 * (i + 1)
+                
+                _warn(f"Groq Rate limit (429). Waiting {wait_time}s before retry {i+1}/{retries}...")
+                time.sleep(wait_time)
+                continue
+            else:
+                _warn(f"Groq rate limit exhausted: {e}")
+                raise
+        except (groq.InternalServerError, groq.APIStatusError) as e:
+            status_code = getattr(e, "status_code", 0)
+            if status_code in (500, 502, 503, 504) and i < retries - 1:
+                wait_time = 10 * (i + 1)
+                _warn(f"Groq Temporary Error ({status_code}). Retrying in {wait_time}s ({i+1}/{retries})...")
+                time.sleep(wait_time)
+                continue
+            _warn(f"Groq API error ({status_code}): {e}")
+            raise
         except Exception as e:
             if "429" in str(e) and i < retries - 1:
                 wait_time = 30 * (i + 1)
-                _warn(f"Rate limit hit (429). Waiting {wait_time}s before retry {i+1}/{retries}...")
+                _warn(f"Groq Error (429). Waiting {wait_time}s before retry {i+1}/{retries}...")
                 time.sleep(wait_time)
                 continue
-            _warn(f"Groq error: {e}")
+            if ("503" in str(e) or "500" in str(e)) and i < retries - 1:
+                wait_time = 15 * (i + 1)
+                _warn(f"Groq error ({e}). Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            _warn(f"Groq unexpected error: {e}")
+            raise
+
+def call_gemini_safe(system: str, user: str, retries: int = 3) -> str:
+    """Call Gemini as a backup for Groq."""
+    for i in range(retries):
+        try:
+            # If system instruction is provided, use it. Otherwise, just user prompt.
+            if system:
+                model = genai.GenerativeModel(
+                    model_name=GEMINI_MODEL,
+                    system_instruction=system
+                )
+            else:
+                model = genai.GenerativeModel(model_name=GEMINI_MODEL)
+                
+            resp = model.generate_content(user)
+            return resp.text
+        except Exception as e:
+            # Handle Quota / Rate Limits (ResourceExhausted)
+            if isinstance(e, google_exceptions.ResourceExhausted) and i < retries - 1:
+                wait_time = 30 # Default
+                # Try to extract the exact wait time from error details
+                if hasattr(e, "details"):
+                    for detail in e.details:
+                        if isinstance(detail, error_details_pb2.RetryInfo):
+                            wait_time = detail.retry_delay.seconds + 5
+                            break
+                
+                _warn(f"Gemini quota exceeded. Waiting {wait_time}s as requested by API...")
+                time.sleep(wait_time)
+                continue
+
+            # If 404, the model name might be slightly different or missing from your account
+            if "404" in str(e):
+                if GEMINI_MODEL == "gemini-2.5-pro":
+                    _warn("gemini-2.5-pro not found, trying gemini-2.0-flash...")
+                    globals()["GEMINI_MODEL"] = "gemini-2.0-flash"
+                    continue
+                elif GEMINI_MODEL == "gemini-2.5-flash":
+                    _warn("gemini-2.5-flash not found, trying gemini-2.0-flash...")
+                    globals()["GEMINI_MODEL"] = "gemini-2.0-flash"
+                    continue
+                elif GEMINI_MODEL == "gemini-2.0-pro":
+                    _warn("gemini-2.0-pro doesn't exist, trying gemini-2.5-pro...")
+                    globals()["GEMINI_MODEL"] = "gemini-2.5-pro"
+                    continue
+                elif GEMINI_MODEL == "gemini-2.0-flash":
+                    _warn("gemini-2.0-flash not found, trying gemini-1.5-flash...")
+                    globals()["GEMINI_MODEL"] = "gemini-1.5-flash"
+                    continue
+                elif GEMINI_MODEL == "gemini-1.5-flash-latest":
+                    _warn("gemini-1.5-flash-latest not found, trying gemini-1.5-flash...")
+                    globals()["GEMINI_MODEL"] = "gemini-1.5-flash"
+                    continue
+                elif GEMINI_MODEL == "gemini-1.5-pro":
+                    _warn("gemini-1.5-pro not found, falling back to gemini-2.0-flash...")
+                    globals()["GEMINI_MODEL"] = "gemini-2.0-flash"
+                    continue
+                elif GEMINI_MODEL == "gemini-pro":
+                    _warn("gemini-pro not found, falling back to gemini-2.0-flash...")
+                    globals()["GEMINI_MODEL"] = "gemini-2.0-flash"
+                    continue
+
+            if i < retries - 1:
+                wait_time = 10 * (i + 1)
+                _warn(f"Gemini error: {e}. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            _warn(f"Gemini failed: {e}")
             return "[]"
     return "[]"
 
-def parse_course_with_groq(course: dict, pdf_texts: list[dict],
+def call_llm_safe(groq_client: Groq, system: str, user: str) -> str:
+    """Try Groq first, fallback to Gemini only if Groq retries fail or limit reached."""
+    try:
+        return call_groq_safe(groq_client, system, user)
+    except Exception as e:
+        # Don't fallback for simple auth errors
+        if "API_KEY_INVALID" in str(e).upper():
+            raise 
+        _info(f"Groq failed definitively ({e}). Switching to Gemini backup...")
+        return call_gemini_safe(system, user)
+
+def parse_course_with_ai(course: dict, pdf_texts: list[dict],
                             student_name: str, student_number: str,
                             client: Groq, messages: list[dict] | None = None) -> list[dict]:
     today = datetime.now(ZoneInfo(TIMEZONE)).strftime("%A, %d %B %Y")
@@ -492,7 +616,7 @@ def parse_course_with_groq(course: dict, pdf_texts: list[dict],
         else:
             _info(f"Extracting findings from PDF: {pdf['name']} (from {pdf.get('week', 'General')})...")
             user_prompt = f"{course_header}\n\nSOURCE: PDF '{pdf['name']}' found in section '{pdf.get('week', 'General')}'\n\nCONTENT:\n{pdf['text']}"
-            raw = call_groq_safe(client, EXTRACTION_SYSTEM_PROMPT, user_prompt)
+            raw = call_llm_safe(client, EXTRACTION_SYSTEM_PROMPT, user_prompt)
             data = _parse_json_response(raw)
             findings.append({"source": f"PDF: {pdf['name']} (from {pdf.get('week', 'Gen')})", "data": data})
             cache[cache_key] = data
@@ -510,7 +634,7 @@ def parse_course_with_groq(course: dict, pdf_texts: list[dict],
         else:
             _info(f"Extracting findings from activities batch {i//chunk_size + 1}...")
             user_prompt = f"{course_header}\n\nSOURCE: Moodle Activities Batch\n\nCONTENT:\n{json.dumps(chunk, ensure_ascii=False)}"
-            raw = call_groq_safe(client, EXTRACTION_SYSTEM_PROMPT, user_prompt)
+            raw = call_llm_safe(client, EXTRACTION_SYSTEM_PROMPT, user_prompt)
             data = _parse_json_response(raw)
             findings.append({"source": f"Activities Batch {i//chunk_size+1}", "data": data})
             cache[cache_key] = data
@@ -524,13 +648,12 @@ def parse_course_with_groq(course: dict, pdf_texts: list[dict],
         else:
             _info(f"Extracting findings from announcements...")
             user_prompt = f"{course_header}\n\nSOURCE: Section Announcements\n\nCONTENT:\n{json.dumps(course['section_summaries'], ensure_ascii=False)}"
-            raw = call_groq_safe(client, EXTRACTION_SYSTEM_PROMPT, user_prompt)
+            raw = call_llm_safe(client, EXTRACTION_SYSTEM_PROMPT, user_prompt)
             data = _parse_json_response(raw)
             findings.append({"source": "Announcements", "data": data})
             cache[cache_key] = data
 
     # 4. Filter and add relevant instructor messages
-    from moodle_to_calendar import filter_messages_for_course
     rel_msgs = filter_messages_for_course(course, messages or [])
     if rel_msgs:
         msg_hash = get_content_hash(rel_msgs)
@@ -540,14 +663,24 @@ def parse_course_with_groq(course: dict, pdf_texts: list[dict],
         else:
             _info(f"Extracting findings from messages...")
             user_prompt = f"{course_header}\n\nSOURCE: Instructor Messages\n\nCONTENT:\n{json.dumps(rel_msgs, ensure_ascii=False)}"
-            raw = call_groq_safe(client, EXTRACTION_SYSTEM_PROMPT, user_prompt)
+            raw = call_llm_safe(client, EXTRACTION_SYSTEM_PROMPT, user_prompt)
             data = _parse_json_response(raw)
             findings.append({"source": "Messages", "data": data})
             cache[cache_key] = data
 
     save_findings_cache(cache)
 
-    # 5. Final Reconciliation (The "Brain")
+    # ── Final Reconciliation (The "Brain") ──
+    # Check if we already reconciled this exact set of findings for this course
+    recon_hash = get_content_hash({"course_id": course["course_id"], "findings": findings})
+    recon_cache_key = f"recon_{course['course_id']}_{recon_hash}"
+    
+    if recon_cache_key in cache:
+        _info(f"Using cached reconciliation for {course['course_name']}")
+        events = cache[recon_cache_key]
+        _ok(f"Logic complete: {len(events)} events (from cache)")
+        return events
+
     _info(f"Reconciling {len(findings)} sources for {course['course_name']}...")
     week_ref = "\n".join([f"- {s['week']}: {s.get('dates', 'Unknown')}" for s in course.get("section_summaries", [])])
     
@@ -569,11 +702,15 @@ You are the central coordinator. Cross-reference all findings to build a final s
 
 Return ONLY the JSON array.
 """
-    final_raw = call_groq_safe(client, RECONCILIATION_SYSTEM_PROMPT, recon_prompt)
+    final_raw = call_llm_safe(client, RECONCILIATION_SYSTEM_PROMPT, recon_prompt)
     events = _parse_json_response(final_raw)
     
     for ev in events:
         ev.setdefault("course", course["course_name"])
+    
+    # Save to cache
+    cache[recon_cache_key] = events
+    save_findings_cache(cache)
     
     _ok(f"Logic complete: {len(events)} events reconciled")
     return events
@@ -599,31 +736,11 @@ def filter_messages_for_course(course: dict, messages: list[dict]) -> list[dict]
                 filtered.append(m)
                 break
     return filtered
-    """Filter global messages to only those that mention this course ID or name."""
-    if not messages:
-        return []
-    
-    course_id = str(course["course_id"])
-    course_name_clean = re.sub(r"[^a-zA-Z0-9 ]", " ", course["course_name"]).lower()
-    course_tokens = set(course_name_clean.split())
-    
-    filtered = []
-    for m in messages:
-        text_lower = m["text"].lower()
-        if course_id in text_lower:
-            filtered.append(m)
-            continue
-        for token in course_tokens:
-            if len(token) > 2 and token in text_lower:
-                filtered.append(m)
-                break
-    return filtered
-
 
 
 def ai_filter_pdfs(pdf_links: list[dict], course_name: str,
                    choices: dict, client: Groq) -> list[dict]:
-    """Ask Groq to classify PDF names; skip any already cached in choices."""
+    """Ask AI to classify PDF names; skip any already cached in choices."""
     if not pdf_links:
         return []
 
@@ -651,13 +768,8 @@ def ai_filter_pdfs(pdf_links: list[dict], course_name: str,
             f"Return [] if none qualify. No explanation."
         )
         try:
-            resp = client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=256,
-            )
-            raw = resp.choices[0].message.content.strip()
+            raw = call_llm_safe(client, "You are a helpful academic assistant.", prompt)
+            raw = raw.strip()
             raw = re.sub(r"^```[a-z]*\n?", "", raw)
             raw = re.sub(r"\n?```$", "", raw)
             selected = set(json.loads(raw)) if raw != "[]" else set()
@@ -704,20 +816,20 @@ def get_calendar_service():
                 raise FileNotFoundError(f"'{CREDS_FILE}' not found. See README_GOOGLE_SETUP.md")
             flow  = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
-        with open(TOKEN_FILE, "w") as f:
+        with open(TOKEN_FILE, "w", encoding="utf-8") as f:
             f.write(creds.to_json())
     return build("calendar", "v3", credentials=creds)
 
 
 def load_seen() -> set:
     if Path(SEEN_FILE).exists():
-        with open(SEEN_FILE) as f:
+        with open(SEEN_FILE, encoding="utf-8") as f:
             return set(json.load(f))
     return set()
 
 
 def save_seen(seen: set):
-    with open(SEEN_FILE, "w") as f:
+    with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(list(seen), f, indent=2)
 
 
@@ -770,13 +882,13 @@ def create_calendar_events(events: list[dict], dry_run: bool = False) -> int:
 def load_pdf_choices() -> dict:
     """Load saved per-URL PDF include/exclude choices."""
     if Path(PDF_CHOICES_FILE).exists():
-        with open(PDF_CHOICES_FILE) as f:
+        with open(PDF_CHOICES_FILE, encoding="utf-8") as f:
             return json.load(f)
     return {}
 
 
 def save_pdf_choices(choices: dict):
-    with open(PDF_CHOICES_FILE, "w") as f:
+    with open(PDF_CHOICES_FILE, "w", encoding="utf-8") as f:
         json.dump(choices, f, indent=2, ensure_ascii=False)
 
 
@@ -863,24 +975,33 @@ def main():
         print(json.dumps(courses, ensure_ascii=False, indent=2))
         return
 
-    # 2. Set up Groq
+    # 2. Set up LLMs
     groq_key = os.environ.get("GROQ_API_KEY")
     if not groq_key:
-        raise ValueError("Set GROQ_API_KEY in .env  (free at https://console.groq.com)")
+        raise ValueError("Set GROQ_API_KEY in .env")
     client = Groq(api_key=groq_key)
+
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if gemini_key:
+        genai.configure(api_key=gemini_key)
+        _ok("Gemini backup ready")
+    else:
+        _warn("GEMINI_API_KEY not set — no fallback available if Groq fails")
 
     # Fetch recent messages once — passed to every course prompt as extra context
     _section("MESSAGES")
     recent_messages = scraper.get_recent_messages(days=30)
 
-    all_events = []
-    pdf_choices = load_pdf_choices()  # persistent across runs
+    # 3. Preparatory Scraping (PDFs)
+    # We download and extract all text BEFORE hitting the AI loop
+    # so that the networking work is done and we can focus on AI/rate limits.
+    _section("PREPARING DATA")
+    pdf_choices = load_pdf_choices()
+    course_data = []
 
-    # 3. Process each course separately
     for course in courses:
         _course_header(course['course_name'])
-
-        # Download and extract PDF text for this course
+        
         pdf_texts = []
         if not args.no_pdfs and course["pdf_links"]:
             if args.pick_pdfs:
@@ -888,6 +1009,7 @@ def main():
                 _info(f"Downloading {len(useful)} selected PDFs...")
             else:
                 useful = ai_filter_pdfs(course["pdf_links"], course["course_name"], pdf_choices, client)
+            
             for pdf_info in useful:
                 pdf_bytes = scraper.get_cached_pdf(pdf_info["view_url"])
                 if pdf_bytes:
@@ -897,16 +1019,30 @@ def main():
                         _ok(f"Extracted {len(text):,} chars from '{pdf_info['name']}'")
                     else:
                         _warn(f"No text extracted from '{pdf_info['name']}' (may be scanned)")
-
-        # Skip course if nothing to process
+        
+        # Check if course has anything useful at all
         has_dated_activities = any(a.get("due") or a.get("opened") for a in course["activities"])
         has_summaries        = bool(course.get("section_summaries"))
+        
         if not has_dated_activities and not pdf_texts and not has_summaries and not recent_messages:
-            _skip(f"Nothing to process — skipping")
+            _skip("Nothing to process — skipping")
             continue
+            
+        course_data.append({
+            "course": course,
+            "pdf_texts": pdf_texts
+        })
 
-        # Send to Groq
-        events = parse_course_with_groq(course, pdf_texts, student_name, student_number, client, recent_messages)
+    # 4. AI Processing Phase
+    _section("AI PROCESSING")
+    all_events = []
+    
+    for item in course_data:
+        course = item["course"]
+        pdf_texts = item["pdf_texts"]
+        _course_header(f"AI: {course['course_name']}")
+        
+        events = parse_course_with_ai(course, pdf_texts, student_name, student_number, client, recent_messages)
         all_events.extend(events)
 
     _section(f"RESULTS")
