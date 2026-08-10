@@ -21,3 +21,5 @@ The script currently relies on specific CSS selectors (`li.section.course-sectio
 3. **Test with `OYS_BASE_URL`**:
    - Set `OYS_BASE_URL=https://oys.baskent.edu.tr` in `.env`.
    - Run the script in dry-run mode (`python moodle_to_calendar.py --dry-run`) to verify extraction works without making calendar changes.
+
+> **Note**: This migration is a priority for the 2026-2027 academic year.
