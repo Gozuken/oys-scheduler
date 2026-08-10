@@ -40,7 +40,7 @@ Get a free Groq API key at [console.groq.com](https://console.groq.com).
 
 ### 4. Set your course IDs
 
-Edit `COURSE_IDS` in the script to match your enrolled courses. The ID is the number in the URL when you open a course: `oys2.baskent.edu.tr/course/view.php?id=XXXXX`.
+Edit `COURSE_IDS` in the script to match your enrolled courses. The ID is the number in the URL when you open a course: `oys.baskent.edu.tr/course/view.php?id=XXXXX`.
 
 ## Usage
 

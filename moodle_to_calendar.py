@@ -50,7 +50,7 @@ from googleapiclient.errors import HttpError
 
 load_dotenv()
 
-BASE_URL   = "https://oys2.baskent.edu.tr"
+BASE_URL   = os.environ.get("OYS_BASE_URL", "https://oys2.baskent.edu.tr")
 LOGIN_URL  = f"{BASE_URL}/login/index.php"
 TIMEZONE   = "Europe/Istanbul"
 SCOPES     = ["https://www.googleapis.com/auth/calendar"]
